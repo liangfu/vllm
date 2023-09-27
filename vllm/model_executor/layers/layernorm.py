@@ -2,9 +2,6 @@
 import torch
 import torch.nn as nn
 
-from vllm import layernorm_ops
-
-
 class RMSNorm(nn.Module):
     """Root mean square normalization.
 
@@ -22,6 +19,8 @@ class RMSNorm(nn.Module):
         self.variance_epsilon = eps
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
+        from vllm import layernorm_ops
+
         out = torch.empty_like(x)
         layernorm_ops.rms_norm(
             out,

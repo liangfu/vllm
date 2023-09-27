@@ -84,6 +84,8 @@ class VocabParallelEmbedding(torch.nn.Module):
                  params_dtype: torch.dtype=None,
                  use_cpu_initialization: bool=False,
                  perform_initialization: bool=False):
+        import torch_xla.core.xla_model as xm
+
         super(VocabParallelEmbedding, self).__init__()
         assert not perform_initialization
         assert not use_cpu_initialization
@@ -112,7 +114,8 @@ class VocabParallelEmbedding(torch.nn.Module):
 
         self.weight = Parameter(torch.empty(
             self.num_embeddings_per_partition, self.embedding_dim,
-            device=torch.cuda.current_device(), dtype=params_dtype))
+            # device=torch.cuda.current_device(), dtype=params_dtype))
+            device=xm.xla_device(), dtype=params_dtype))
 
     def forward(self, input_):
         if self.tensor_model_parallel_size > 1:
@@ -175,6 +178,8 @@ class ColumnParallelLinear(torch.nn.Module):
                  perform_initialization=False,
                  quant_config=None,
                  ):
+        import torch_xla.core.xla_model as xm
+
         super(ColumnParallelLinear, self).__init__()
         assert not perform_initialization
         assert not use_cpu_initialization
@@ -200,7 +205,8 @@ class ColumnParallelLinear(torch.nn.Module):
         if bias:
             self.bias = Parameter(torch.empty(
                 self.output_size_per_partition,
-                device=torch.cuda.current_device(),
+                # device=torch.cuda.current_device(),
+                device=xm.xla_device(),
                 dtype=params_dtype))
             set_tensor_model_parallel_attributes(self.bias, True, 0, stride)
             # Always initialize bias to zero.
@@ -210,9 +216,11 @@ class ColumnParallelLinear(torch.nn.Module):
             self.register_parameter('bias', None)
 
     def create_weights(self, dtype: torch.dtype) -> None:
+        import torch_xla.core.xla_model as xm
         self.weight = Parameter(torch.empty(
             self.output_size_per_partition, self.input_size,
-            device=torch.cuda.current_device(), dtype=dtype))
+            # device=torch.cuda.current_device(), dtype=dtype))
+            device=xm.xla_device(), dtype=dtype))
 
     def apply_weights(
         self,
@@ -292,6 +300,8 @@ class RowParallelLinear(torch.nn.Module):
                  reduce_results=True,
                  quant_config=None,
                  ):
+        import torch_xla.core.xla_model as xm
+
         super(RowParallelLinear, self).__init__()
         assert not perform_initialization
         assert not use_cpu_initialization
@@ -318,7 +328,7 @@ class RowParallelLinear(torch.nn.Module):
 
         if bias:
             self.bias = Parameter(torch.empty(
-                self.output_size, device=torch.cuda.current_device(),
+                self.output_size, device=xm.xla_device(), # torch.cuda.current_device(),
                 dtype=params_dtype))
 
             # Always initialize bias to zero.
@@ -328,9 +338,11 @@ class RowParallelLinear(torch.nn.Module):
             self.register_parameter('bias', None)
 
     def create_weights(self, dtype: torch.dtype) -> None:
+        import torch_xla.core.xla_model as xm
         self.weight = Parameter(torch.empty(
                 self.output_size, self.input_size_per_partition,
-                device=torch.cuda.current_device(), dtype=dtype))
+                # device=torch.cuda.current_device(), dtype=dtype))
+                device=xm.xla_device(), dtype=dtype))
 
     def apply_weights(self, x: torch.Tensor) -> torch.Tensor:
         return F.linear(x, self.weight)

@@ -13,22 +13,22 @@ from vllm.model_executor.weight_utils import (get_quant_config,
 
 # TODO(woosuk): Lazy-load the model classes.
 _MODEL_REGISTRY = {
-    "AquilaModel": AquilaForCausalLM,
-    "BaiChuanForCausalLM": BaiChuanForCausalLM,  # baichuan-7b
-    "BaichuanForCausalLM": BaichuanForCausalLM,  # baichuan-13b
+    # "AquilaModel": AquilaForCausalLM,
+    # "BaiChuanForCausalLM": BaiChuanForCausalLM,  # baichuan-7b
+    # "BaichuanForCausalLM": BaichuanForCausalLM,  # baichuan-13b
     "BloomForCausalLM": BloomForCausalLM,
-    "FalconForCausalLM": FalconForCausalLM,
+    # "FalconForCausalLM": FalconForCausalLM,
     "GPT2LMHeadModel": GPT2LMHeadModel,
-    "GPTBigCodeForCausalLM": GPTBigCodeForCausalLM,
-    "GPTJForCausalLM": GPTJForCausalLM,
-    "GPTNeoXForCausalLM": GPTNeoXForCausalLM,
-    "InternLMForCausalLM": InternLMForCausalLM,
+    # "GPTBigCodeForCausalLM": GPTBigCodeForCausalLM,
+    # "GPTJForCausalLM": GPTJForCausalLM,
+    # "GPTNeoXForCausalLM": GPTNeoXForCausalLM,
+    # "InternLMForCausalLM": InternLMForCausalLM,
     "LlamaForCausalLM": LlamaForCausalLM,
     "LLaMAForCausalLM": LlamaForCausalLM,  # For decapoda-research/llama-*
-    "MPTForCausalLM": MPTForCausalLM,
+    # "MPTForCausalLM": MPTForCausalLM,
     "OPTForCausalLM": OPTForCausalLM,
-    "QWenLMHeadModel": QWenLMHeadModel,
-    "RWForCausalLM": FalconForCausalLM,
+    # "QWenLMHeadModel": QWenLMHeadModel,
+    # "RWForCausalLM": FalconForCausalLM,
 }
 
 # FIXME(woosuk): Remove this once all models support quantization.
@@ -91,7 +91,7 @@ def get_model(model_config: ModelConfig) -> nn.Module:
         else:
             model = model_class(model_config.hf_config)
         if model_config.load_format == "dummy":
-            model = model.cuda()
+            # model = model.cuda()
             # NOTE(woosuk): For accurate performance evaluation, we assign
             # random values to the weights.
             initialize_dummy_weights(model)
@@ -99,5 +99,5 @@ def get_model(model_config: ModelConfig) -> nn.Module:
             # Load the weights from the cached or downloaded files.
             model.load_weights(model_config.model, model_config.download_dir,
                                model_config.load_format, model_config.revision)
-            model = model.cuda()
+            # model = model.cuda()
     return model.eval()

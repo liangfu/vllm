@@ -3,7 +3,6 @@ from typing import Optional
 import torch
 from torch.nn.parameter import Parameter
 
-from vllm import quantization_ops
 from vllm.model_executor.parallel_utils.tensor_parallel.layers import (
     ColumnParallelLinear, RowParallelLinear)
 
@@ -49,6 +48,8 @@ class AWQColumnParallelLinear(ColumnParallelLinear):
         x: torch.Tensor,
         bias: Optional[torch.Tensor],
     ) -> torch.Tensor:
+        from vllm import quantization_ops
+
         pack_factor = self.quant_config.pack_factor
         out_shape = (x.shape[-2], self.qweight.shape[-1] * pack_factor)
         reshaped_x = x.reshape(-1, x.shape[-1])
@@ -94,6 +95,8 @@ class AWQRowParallelLinear(RowParallelLinear):
         )
 
     def apply_weights(self, x: torch.Tensor) -> torch.Tensor:
+        from vllm import quantization_ops
+
         pack_factor = self.quant_config.pack_factor
         out_shape = (x.shape[-2], self.qweight.shape[-1] * pack_factor)
         reshaped_x = x.reshape(-1, x.shape[-1])

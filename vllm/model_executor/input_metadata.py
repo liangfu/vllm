@@ -1,7 +1,6 @@
 from typing import Dict, List, Tuple
 
 import torch
-from xformers.ops import AttentionBias
 
 from vllm.sampling_params import SamplingParams
 from vllm.sequence import SequenceData
@@ -50,7 +49,8 @@ class InputMetadata:
         assert context_lens.shape[0] == self.num_generation_tokens
 
         # Set during the execution of the first attention op.
-        self.attn_bias: List[AttentionBias] = []
+        # self.attn_bias: List[AttentionBias] = []
+        self.attn_bias = []
 
     def __repr__(self) -> str:
         # Print only useful metadata.

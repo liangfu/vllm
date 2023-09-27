@@ -47,16 +47,19 @@ class Worker:
         self.gpu_cache = None
 
     def init_model(self):
+        import torch_xla.core.xla_model as xm
+
         # This env var set by Ray causes exceptions with graph building.
         os.environ.pop("NCCL_ASYNC_ERROR_HANDLING", None)
         # Env vars will be set by Ray.
         self.rank = self.rank if self.rank is not None else int(
             os.getenv("RANK", "-1"))
         local_rank = int(os.getenv("LOCAL_RANK", "0"))
-        self.device = torch.device(f"cuda:{local_rank}")
+        # self.device = torch.device(f"cuda:{local_rank}")
+        self.device = xm.xla_device(local_rank)
         if self.rank < 0:
             raise ValueError("Invalid or unspecified rank.")
-        torch.cuda.set_device(self.device)
+        # torch.cuda.set_device(self.device)
 
         # Initialize the distributed environment.
         _init_distributed_environment(self.parallel_config, self.rank,
@@ -75,8 +78,9 @@ class Worker:
     ) -> Tuple[int, int]:
         # Profile the memory usage of the model and get the maximum number of
         # cache blocks that can be allocated with the remaining free memory.
-        torch.cuda.empty_cache()
-        torch.cuda.reset_peak_memory_stats()
+
+        # torch.cuda.empty_cache()
+        # torch.cuda.reset_peak_memory_stats()
 
         # Profile memory usage with max_num_sequences sequences and the total
         # number of tokens equal to max_num_batched_tokens.
@@ -115,8 +119,9 @@ class Worker:
 
         # Calculate the number of blocks that can be allocated with the
         # profiled peak memory.
-        torch.cuda.synchronize()
-        peak_memory = torch.cuda.max_memory_allocated()
+
+        # torch.cuda.synchronize()
+        peak_memory = 0 # torch.cuda.max_memory_allocated()
         total_gpu_memory = get_gpu_memory()
         cache_block_size = CacheEngine.get_cache_block_size(
             block_size, self.model_config, self.parallel_config)
@@ -126,7 +131,7 @@ class Worker:
         num_cpu_blocks = int(cpu_swap_space // cache_block_size)
         num_gpu_blocks = max(num_gpu_blocks, 0)
         num_cpu_blocks = max(num_cpu_blocks, 0)
-        torch.cuda.empty_cache()
+        # torch.cuda.empty_cache()
 
         # Reset the seed to ensure that the random state is not affected by
         # the model initialization and profiling.
@@ -145,6 +150,8 @@ class Worker:
         self,
         seq_group_metadata_list: List[SequenceGroupMetadata],
     ) -> Tuple[torch.Tensor, torch.Tensor, InputMetadata]:
+        import torch_xla.core.xla_model as xm
+
         seq_groups: List[Tuple[List[int], SamplingParams]] = []
         input_tokens: List[int] = []
         input_positions: List[int] = []
@@ -228,25 +235,26 @@ class Worker:
         input_positions = _pad_to_alignment(input_positions, multiple_of=8)
 
         # Convert to tensors.
+        device = xm.xla_device()
         tokens_tensor = torch.tensor(input_tokens,
                                      dtype=torch.long,
-                                     device="cuda")
+                                     device=device)
         positions_tensor = torch.tensor(input_positions,
                                         dtype=torch.long,
-                                        device="cuda")
+                                        device=device)
         slot_mapping_tensor = torch.tensor(slot_mapping,
                                            dtype=torch.int,
-                                           device="cuda")
+                                           device=device)
         context_lens_tensor = torch.tensor(context_lens,
                                            dtype=torch.int,
-                                           device="cuda")
+                                           device=device)
         padded_block_tables = [
             _pad_to_max(block_table, max_num_blocks_per_seq)
             for block_table in generation_block_tables
         ]
         block_tables_tensor = torch.tensor(padded_block_tables,
                                            dtype=torch.int,
-                                           device="cuda")
+                                           device=device)
 
         seq_data: Dict[int, SequenceData] = {}
         for seq_group_metadata in seq_group_metadata_list:
@@ -329,14 +337,15 @@ def _init_distributed_environment(
             "is not already initialized")
     else:
         torch.distributed.init_process_group(
-            backend="nccl",
+            # backend="nccl",
+            backend="xla",
             world_size=parallel_config.world_size,
             rank=rank,
-            init_method=distributed_init_method,
+            # init_method=distributed_init_method,
         )
 
     # A small all_reduce for warmup.
-    torch.distributed.all_reduce(torch.zeros(1).cuda())
+    # torch.distributed.all_reduce(torch.zeros(1).cuda())
     initialize_model_parallel(parallel_config.tensor_parallel_size,
                               parallel_config.pipeline_parallel_size)
 

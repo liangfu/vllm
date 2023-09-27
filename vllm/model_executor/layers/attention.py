@@ -3,13 +3,7 @@ from typing import List, Optional
 
 import torch
 import torch.nn as nn
-from xformers import ops as xops
-from xformers.ops.fmha.attn_bias import (BlockDiagonalCausalMask,
-                                         LowerTriangularMaskWithTensorBias)
 
-from vllm import attention_ops
-from vllm import cache_ops
-from vllm import pos_encoding_ops
 from vllm.model_executor.input_metadata import InputMetadata
 
 _SUPPORTED_HEAD_SIZES = [64, 80, 96, 112, 128, 256]
@@ -57,6 +51,8 @@ class PagedAttention(nn.Module):
                  head_size: int,
                  scale: float,
                  num_kv_heads: Optional[int] = None) -> None:
+        import torch_xla.core.xla_model as xm
+
         super().__init__()
         self.num_heads = num_heads
         self.head_size = head_size
@@ -66,7 +62,7 @@ class PagedAttention(nn.Module):
         assert self.num_heads % self.num_kv_heads == 0
         self.num_queries_per_kv = self.num_heads // self.num_kv_heads
         self.head_mapping = torch.repeat_interleave(
-            torch.arange(self.num_kv_heads, dtype=torch.int32, device="cuda"),
+            torch.arange(self.num_kv_heads, dtype=torch.int32, device=xm.xla_device()),
             self.num_queries_per_kv)
 
         if self.head_size not in _SUPPORTED_HEAD_SIZES:
@@ -78,6 +74,8 @@ class PagedAttention(nn.Module):
         input_metadata: InputMetadata,
         dtype: torch.dtype,
     ) -> None:
+        from xformers.ops.fmha.attn_bias import BlockDiagonalCausalMask
+
         del dtype  # Unused.
         if input_metadata.attn_bias:
             # Already set by a previous layer.
@@ -103,6 +101,7 @@ class PagedAttention(nn.Module):
             value: shape = [num_prompt_tokens, num_kv_heads, head_size]
             input_metadata: metadata for paged attention.
         """
+        from xformers import ops as xops
 
         if self.num_kv_heads != self.num_heads:
             # Project the key and value tensors to the desired number of heads.
@@ -143,6 +142,8 @@ class PagedAttention(nn.Module):
                 block_size]
             input_metadata: metadata for paged attention.
         """
+        from vllm import attention_ops
+
         block_size = value_cache.shape[3]
         attention_ops.single_query_cached_kv_attention(
             output,
@@ -355,6 +356,8 @@ class PagedAttentionWithALiBi(PagedAttention):
 
     def set_attn_bias(self, input_metadata: InputMetadata,
                       dtype: torch.dtype) -> None:
+        from xformers.ops.fmha.attn_bias import LowerTriangularMaskWithTensorBias
+
         if input_metadata.attn_bias:
             # Already set by a previous layer.
             return
@@ -401,6 +404,8 @@ class PagedAttentionWithALiBi(PagedAttention):
             value: shape = [num_prompt_tokens, num_kv_heads, head_size]
             input_metadata: metadata for paged attention.
         """
+        from xformers import ops as xops
+
         if self.num_kv_heads != self.num_heads:
             # Project the key and value tensors to the desired number of heads.
             key = torch.repeat_interleave(key, self.num_queries_per_kv, dim=1)
@@ -446,6 +451,8 @@ class PagedAttentionWithALiBi(PagedAttention):
                 block_size]
             input_metadata: metadata for paged attention.
         """
+        from vllm import attention_ops
+
         block_size = value_cache.shape[3]
         attention_ops.single_query_cached_kv_attention(
             output,
