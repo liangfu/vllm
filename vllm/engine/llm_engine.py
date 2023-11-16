@@ -147,7 +147,7 @@ class LLMEngine:
 
         self.workers: List[Worker] = []
         for bundle in placement_group.bundle_specs:
-            if not bundle.get("GPU", 0):
+            if not bundle.get("neuron_cores", 0):
                 continue
             worker = ray.remote(
                 num_cpus=0,
@@ -546,6 +546,11 @@ class LLMEngine:
         seq_group_metadata_list, scheduler_outputs, ignored = self._schedule()
         if scheduler_outputs.is_empty():
             return ignored
+
+        # Debugging
+        assert len(seq_group_metadata_list) == len(scheduler_outputs.scheduled_seq_groups), \
+            f"seq_groups should match between metadata ({len(seq_group_metadata_list)}) " \
+            f"and scheduled ({len(scheduler_outputs.scheduled_seq_groups)})"
 
         # Execute the model.
         output = self._run_workers(

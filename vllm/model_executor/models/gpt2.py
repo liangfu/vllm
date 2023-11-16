@@ -232,69 +232,28 @@ class GPT2LMHeadModel(nn.Module):
                      model_name_or_path: str,
                      cache_dir: Optional[str] = None,
                      load_format: str = "auto",
-                     revision: Optional[str] = None):
-        tensor_model_parallel_world_size = (
-            get_tensor_model_parallel_world_size())
-        tensor_model_parallel_rank = get_tensor_model_parallel_rank()
-        state_dict = self.state_dict()
+                     revision: Optional[str] = None,
+                     **kwargs):
+        from transformers.models.gpt2 import GPT2LMHeadModel
+        from transformers_neuronx.module import save_pretrained_split
+        from transformers_neuronx.gpt2.model import GPT2ForSampling
 
-        for name, loaded_weight in hf_model_weights_iterator(
-                model_name_or_path, cache_dir, load_format, revision):
-            if "lm_head.weight" in name:
-                # GPT-2 ties the weights of the embedding layer and the final
-                # linear layer.
-                continue
-            if ".attn.bias" in name or ".attn.masked_bias" in name:
-                # Skip attention mask.
-                # NOTE: "c_attn.bias" should not be skipped.
-                continue
+        def amp_callback(model, dtype):
+            # cast attention and mlp to low precision only; layernorms stay as f32
+            for block in model.transformer.h:
+                block.ln_1.to(torch.float32)
+                block.attn.to(dtype)
+                block.ln_2.to(torch.float32)
+                block.mlp.to(dtype)
+            model.transformer.ln_f.to(torch.float32)
+            model.lm_head.to(dtype)
 
-            if not name.startswith("transformer."):
-                name = "transformer." + name
-
-            loaded_weight = convert_pyslice_to_tensor(loaded_weight)
-
-            # The HF's GPT-2 implementation uses Conv1D instead of Linear.
-            # Because of this, we need to transpose the weights.
-            for conv1d_weight_name in ["c_attn", "c_proj", "c_fc"]:
-                if conv1d_weight_name not in name:
-                    continue
-                if not name.endswith(".weight"):
-                    continue
-                loaded_weight = loaded_weight.t()
-            param = state_dict[name]
-
-            if name == "transformer.wte.weight":
-                load_padded_tensor_parallel_vocab(param, loaded_weight,
-                                                  tensor_model_parallel_rank)
-                continue
-
-            # For the fused QKV linear layer, manually shard the weights.
-            if "c_attn" in name:
-                # GPT-2's fused QKV has the shape of
-                # [3 * num_heads * head_size, hidden_size].
-                # When tensor parallelism is used, we shard the weights along
-                # the head dimension.
-                total_num_heads = self.config.num_attention_heads
-                hidden_size = self.config.hidden_size
-                head_size = hidden_size // total_num_heads
-                num_heads = total_num_heads // tensor_model_parallel_world_size
-                head_start = tensor_model_parallel_rank * num_heads
-                head_end = (tensor_model_parallel_rank + 1) * num_heads
-
-                if name.endswith(".weight"):
-                    loaded_weight = loaded_weight.view(3, total_num_heads,
-                                                       head_size, hidden_size)
-                    loaded_weight = loaded_weight[:, head_start:head_end, :, :]
-                    loaded_weight = loaded_weight.reshape(-1, hidden_size)
-                elif name.endswith(".bias"):
-                    loaded_weight = loaded_weight.view(3, total_num_heads,
-                                                       head_size)
-                    loaded_weight = loaded_weight[:, head_start:head_end, :]
-                    loaded_weight = loaded_weight.reshape(-1)
-                else:
-                    raise ValueError(f"Unexpected parameter name {name}")
-            load_tensor_parallel_weights(param, loaded_weight, name,
-                                         self._column_parallel_weights,
-                                         self._row_parallel_weights,
-                                         tensor_model_parallel_rank)
+        hf_model = GPT2LMHeadModel.from_pretrained(model_name_or_path, low_cpu_mem_usage=True)
+        # amp_callback(hf_model, torch.bfloat16)
+        amp_callback(hf_model, torch.float32)
+        # import pdb
+        # pdb.set_trace()
+        save_pretrained_split(hf_model, f"{model_name_or_path}-split")
+        
+        self.model = GPT2ForSampling.from_pretrained(f"{model_name_or_path}-split", **kwargs)
+        self.model.to_neuron()

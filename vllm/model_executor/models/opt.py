@@ -21,6 +21,9 @@
 The input of the model is flattened to a 1D tensor of tokens. The model uses
 InputMetadata to extract the original 2D shape of the input.
 """
+import os
+import tempfile
+from contextlib import contextmanager
 from typing import List, Optional, Tuple
 
 import torch
@@ -170,86 +173,14 @@ class OPTDecoderLayer(nn.Module):
         return hidden_states
 
 
-class OPTDecoder(nn.Module):
-
-    def __init__(self, config: OPTConfig):
-        super().__init__()
-        self.config = config
-        self.padding_idx = config.pad_token_id
-        self.max_target_positions = config.max_position_embeddings
-        self.vocab_size = config.vocab_size
-
-        self.embed_tokens = VocabParallelEmbedding(
-            config.vocab_size,
-            config.word_embed_proj_dim,
-            perform_initialization=False)
-        # Positional embeddings are replicated (not sharded).
-        self.embed_positions = OPTLearnedPositionalEmbedding(
-            config.max_position_embeddings, config.hidden_size)
-
-        # Project out & in will be replicated if they exist.
-        if config.word_embed_proj_dim != config.hidden_size:
-            self.project_out = nn.Linear(config.hidden_size,
-                                         config.word_embed_proj_dim,
-                                         bias=False)
-        else:
-            self.project_out = None
-
-        if config.word_embed_proj_dim != config.hidden_size:
-            self.project_in = nn.Linear(config.word_embed_proj_dim,
-                                        config.hidden_size,
-                                        bias=False)
-        else:
-            self.project_in = None
-
-        # Note that the only purpose of `config._remove_final_layer_norm` is to
-        # keep backward compatibility with checkpoints that have been fine-tuned
-        # before transformers v4.20.1
-        # see https://github.com/facebookresearch/metaseq/pull/164
-        if config.do_layer_norm_before and not config._remove_final_layer_norm:
-            self.final_layer_norm = nn.LayerNorm(
-                config.hidden_size,
-                elementwise_affine=config.layer_norm_elementwise_affine)
-        else:
-            self.final_layer_norm = None
-
-        self.layers = nn.ModuleList(
-            [OPTDecoderLayer(config) for _ in range(config.num_hidden_layers)])
-
-    def forward(
-        self,
-        input_ids: torch.Tensor,
-        positions: torch.Tensor,
-        kv_caches: List[KVCache],
-        input_metadata: InputMetadata,
-        cache_events: Optional[List[torch.cuda.Event]],
-    ) -> torch.Tensor:
-        inputs_embeds = self.embed_tokens(input_ids)
-        pos_embeds = self.embed_positions(positions)
-        if self.project_in is not None:
-            inputs_embeds = self.project_in(inputs_embeds)
-        hidden_states = inputs_embeds + pos_embeds
-
-        for i in range(len(self.layers)):
-            if cache_events is None:
-                cache_event = None
-            else:
-                cache_event = cache_events[i]
-            layer = self.layers[i]
-            hidden_states = layer(hidden_states, kv_caches[i], input_metadata,
-                                  cache_event)
-
-        if self.final_layer_norm is not None:
-            hidden_states = self.final_layer_norm(hidden_states)
-        if self.project_out is not None:
-            hidden_states = self.project_out(hidden_states)
-        return hidden_states
-
-
 class OPTModel(nn.Module):
 
-    def __init__(self, config: OPTConfig):
+    def __init__(self, config: OPTConfig, n_positions, batch_size, amp, tp_degree, **kwargs):
+        from transformers_neuronx.opt.config import OPTConfig
+        from transformers_neuronx.opt.model import OPTDecoder
+
         super().__init__()
+        config = OPTConfig(config, n_positions, batch_size, amp, tp_degree, **kwargs)
         self.decoder = OPTDecoder(config)
 
     def forward(
@@ -269,7 +200,7 @@ class OPTForCausalLM(nn.Module):
     def __init__(self, config):
         super().__init__()
         self.config = config
-        self.model = OPTModel(config)
+        self.model = OPTModel(config, n_positions=128, batch_size=1, amp='f16', tp_degree=32)
         # TODO(zhuohan): create a new weight after implementing pipeline
         #                parallelism
         self.lm_head_weight = self.model.decoder.embed_tokens.weight
@@ -294,43 +225,24 @@ class OPTForCausalLM(nn.Module):
     ]
     _row_parallel_weights = ["out_proj.weight", "fc2.weight"]
 
+
+    @contextmanager
+    def model_dir_context(self, model_name_or_path):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            test_name = model_name_or_path.replace("/", "_")
+            model_dir = os.path.join(tmpdir, f'model-{test_name}')
+            yield model_dir
+
     def load_weights(self,
                      model_name_or_path: str,
                      cache_dir: Optional[str] = None,
                      load_format: str = "auto",
                      revision: Optional[str] = None):
-        tensor_model_parallel_rank = get_tensor_model_parallel_rank()
-        state_dict = self.state_dict()
+        from transformers.models.opt import OPTForCausalLM as opt_for_causal_lm
+        from transformers_neuronx.module import save_pretrained_split
+        # tensor_model_parallel_rank = get_tensor_model_parallel_rank()
+        # state_dict = self.state_dict()
 
-        for name, loaded_weight in hf_model_weights_iterator(
-                model_name_or_path, cache_dir, load_format, revision):
-            if "lm_head.weight" in name:
-                continue
-
-            if name.startswith("decoder."):
-                name = "model." + name
-
-            is_attention_weight = False
-            for stride_id, att_weight_name in enumerate(
-                ["q_proj", "k_proj", "v_proj"]):
-                if att_weight_name not in name:
-                    continue
-                param = state_dict[name.replace(att_weight_name, "qkv_proj")]
-                shard_size = param.shape[0] // 3
-                loaded_weight = loaded_weight[
-                    shard_size * tensor_model_parallel_rank:shard_size *
-                    (tensor_model_parallel_rank + 1)]
-                param_slice = param.data[shard_size * stride_id:shard_size *
-                                         (stride_id + 1)]
-                assert param_slice.shape == loaded_weight.shape
-                param_slice.copy_(loaded_weight)
-                is_attention_weight = True
-                break
-            if is_attention_weight:
-                continue
-
-            param = state_dict[name]
-            load_tensor_parallel_weights(param, loaded_weight, name,
-                                         self._column_parallel_weights,
-                                         self._row_parallel_weights,
-                                         tensor_model_parallel_rank)
+        with self.model_dir_context(model_name_or_path) as model_dir:
+            hf_model = opt_for_causal_lm.from_pretrained(model_name_or_path, low_cpu_mem_usage=True)
+            save_pretrained_split(hf_model, model_dir)

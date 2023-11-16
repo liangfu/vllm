@@ -25,6 +25,7 @@
 The input of the model is flattened to a 1D tensor of tokens. The model uses
 InputMetadata to extract the original 2D shape of the input.
 """
+import os
 from typing import List, Optional, Tuple
 
 import torch
@@ -271,15 +272,7 @@ class LlamaForCausalLM(nn.Module):
         super().__init__()
         self.config = config
         self.quant_config = quant_config
-        self.model = LlamaModel(config, quant_config)
-        vocab_size = ((config.vocab_size + 63) // 64) * 64
-        # NOTE: The LM head is not quantized.
-        self.lm_head = ParallelLinear.column(config.hidden_size,
-                                             vocab_size,
-                                             bias=False,
-                                             gather_output=False,
-                                             perform_initialization=False,
-                                             quant_config=None)
+        self.model = None
         self.sampler = Sampler(config.vocab_size)
 
     def forward(
@@ -290,10 +283,33 @@ class LlamaForCausalLM(nn.Module):
         input_metadata: InputMetadata,
         cache_events: Optional[List[torch.cuda.Event]],
     ) -> SamplerOutput:
-        hidden_states = self.model(input_ids, positions, kv_caches,
-                                   input_metadata, cache_events)
-        next_tokens = self.sampler(self.lm_head.weight, hidden_states,
-                                   input_metadata)
+        # TODO: drop this line
+        batch_size, n_active_tokens = input_ids.shape
+        positions = positions # [:1, :]
+
+        with torch.inference_mode():
+            seq_ids = []
+            block_size = self.model.context_buckets[-1]
+            if input_metadata.num_generation_tokens == 0:
+                num_prompts = input_metadata.num_prompts
+                seq_ids = torch.zeros(num_prompts, 1, dtype=torch.int64, device='cpu')
+                anchor = 0
+                for prompt_id in range(num_prompts):
+                    seq_ids[prompt_id] = input_metadata.slot_mapping[anchor] // block_size
+                    anchor += input_metadata.prompt_lens[prompt_id]
+            else:
+                seq_ids = input_metadata.block_tables
+            print(f"context_lens: {input_metadata.context_lens}")
+            print(f"input_ids: {input_ids}")
+            print(f"cache_ids: {positions}")
+            print(f"seq_ids: {seq_ids}")
+            logits = self.model(input_ids, cache_ids=positions, start_ids=seq_ids)
+            next_tokens = self.sampler(logits, input_metadata)
+        print(f"next_tokens: {[nt[0].output_token for nt in next_tokens]}")
+        # if n_active_tokens == 1:
+        #     import pdb
+        #     pdb.set_trace()
+        #     print()
         return next_tokens
 
     _column_parallel_layers = []
@@ -303,105 +319,16 @@ class LlamaForCausalLM(nn.Module):
                      model_name_or_path: str,
                      cache_dir: Optional[str] = None,
                      load_format: str = "auto",
-                     revision: Optional[str] = None):
-        if self.quant_config is None:
-            weight_suffixes = ["weight"]
-        else:
-            weight_suffixes = self.quant_config.get_tp_tensor_names()
+                     revision: Optional[str] = None,
+                     **kwargs):
+        from transformers_neuronx.llama.model import LlamaForSampling
 
-        column_parallel_weights: List[str] = []
-        for layer in self._column_parallel_layers:
-            for suffix in weight_suffixes:
-                column_parallel_weights.append(f"{layer}.{suffix}")
-        row_parallel_weights: List[str] = []
-        for layer in self._row_parallel_layers:
-            for suffix in weight_suffixes:
-                row_parallel_weights.append(f"{layer}.{suffix}")
+        if not os.path.exists(f"{model_name_or_path}-split"):
+            from transformers.models.llama import LlamaForCausalLM
+            from transformers_neuronx.module import save_pretrained_split
 
-        tp_size = get_tensor_model_parallel_world_size()
-        tensor_model_parallel_rank = get_tensor_model_parallel_rank()
-        q_proj_shard_size = (self.config.hidden_size // tp_size)
-        kv_proj_shard_size = (self.config.hidden_size //
-                              self.config.num_attention_heads *
-                              self.config.num_key_value_heads // tp_size)
-        attention_weight_specs = [
-            # (weight_name, shard_size, offset)
-            ("q_proj", q_proj_shard_size, 0),
-            ("k_proj", kv_proj_shard_size, q_proj_shard_size),
-            ("v_proj", kv_proj_shard_size,
-             q_proj_shard_size + kv_proj_shard_size),
-        ]
-        state_dict = self.state_dict()
+            hf_model = LlamaForCausalLM.from_pretrained(model_name_or_path, low_cpu_mem_usage=True)
+            save_pretrained_split(hf_model, f"{model_name_or_path}-split")
 
-        for name, loaded_weight in hf_model_weights_iterator(
-                model_name_or_path, cache_dir, load_format, revision):
-            if "rotary_emb.inv_freq" in name:
-                continue
-
-            is_packed = False
-            is_transposed = False
-            if self.quant_config is not None:
-                is_packed = self.quant_config.is_packed(name)
-                is_transposed = self.quant_config.is_transposed(name)
-            if is_transposed:
-                loaded_weight = convert_pyslice_to_tensor(loaded_weight)
-                loaded_weight = loaded_weight.T
-
-            is_attention_weight = False
-            for weight_name, shard_size, offset in attention_weight_specs:
-                if weight_name not in name:
-                    continue
-                param = state_dict[name.replace(weight_name, "qkv_proj")]
-                if is_transposed:
-                    param = param.T
-
-                if is_packed:
-                    shard_size //= self.quant_config.pack_factor
-                    offset //= self.quant_config.pack_factor
-
-                loaded_weight = loaded_weight[
-                    shard_size * tensor_model_parallel_rank:shard_size *
-                    (tensor_model_parallel_rank + 1)]
-                param_slice = param.data[offset:offset + shard_size]
-                assert param_slice.shape == loaded_weight.shape
-
-                param_slice.copy_(loaded_weight)
-                is_attention_weight = True
-                break
-            if is_attention_weight:
-                continue
-
-            is_gate_up_weight = False
-            for stride_id, weight_name in enumerate(["gate_proj", "up_proj"]):
-                if weight_name not in name:
-                    continue
-                param = state_dict[name.replace(weight_name, "gate_up_proj")]
-                if is_transposed:
-                    param = param.T
-
-                shard_size = param.shape[0] // 2
-                loaded_weight = loaded_weight[
-                    shard_size * tensor_model_parallel_rank:shard_size *
-                    (tensor_model_parallel_rank + 1)]
-                param_slice = param.data[shard_size * stride_id:shard_size *
-                                         (stride_id + 1)]
-                assert param_slice.shape == loaded_weight.shape
-                param_slice.copy_(loaded_weight)
-                is_gate_up_weight = True
-                break
-            if is_gate_up_weight:
-                continue
-
-            param = state_dict[name]
-            if is_transposed:
-                param = param.T
-
-            if "embed_tokens" in name or "lm_head" in name:
-                load_padded_tensor_parallel_vocab(param, loaded_weight,
-                                                  tensor_model_parallel_rank)
-                continue
-
-            load_tensor_parallel_weights(param, loaded_weight, name,
-                                         column_parallel_weights,
-                                         row_parallel_weights,
-                                         tensor_model_parallel_rank)
+        self.model = LlamaForSampling.from_pretrained(f"{model_name_or_path}-split", **kwargs)
+        self.model.to_neuron()

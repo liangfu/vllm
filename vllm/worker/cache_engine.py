@@ -40,14 +40,14 @@ class CacheEngine:
         self.num_cpu_blocks = cache_config.num_cpu_blocks
 
         # Initialize the cache.
-        self.gpu_cache = self.allocate_gpu_cache()
+        self.gpu_cache = [] # self.allocate_gpu_cache()
         self.cpu_cache = self.allocate_cpu_cache()
 
         # Initialize the stream for caching operations.
-        self.cache_stream = torch.cuda.Stream()
-        assert self.cache_stream != torch.cuda.current_stream()
+        self.cache_stream = None # torch.cuda.Stream()
+        # assert self.cache_stream != torch.cuda.current_stream()
         # Initialize the events for stream synchronization.
-        self.events = [torch.cuda.Event() for _ in range(self.num_layers)]
+        self.events = [] # [torch.cuda.Event() for _ in range(self.num_layers)]
 
     def get_key_block_shape(self) -> Tuple[int, int, int, int]:
         element_size = torch.tensor([], dtype=self.dtype).element_size()

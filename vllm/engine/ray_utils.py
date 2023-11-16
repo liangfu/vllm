@@ -90,28 +90,28 @@ def initialize_cluster(
         # We are in a placement group
         bundles = current_placement_group.bundle_specs
         # Verify that we can use the placement group.
-        gpu_bundles = 0
+        neuron_core_bundles = 0
         for bundle in bundles:
-            bundle_gpus = bundle.get("GPU", 0)
-            if bundle_gpus > 1:
+            bundle_neuron_cores = bundle.get("neuron_cores", 0)
+            if bundle_neuron_cores > 1:
                 raise ValueError(
-                    "Placement group bundle cannot have more than 1 GPU.")
-            if bundle_gpus:
-                gpu_bundles += 1
-        if parallel_config.world_size > gpu_bundles:
+                    "Placement group bundle cannot have more than 1 NeuronCore.")
+            if bundle_neuron_cores:
+                neuron_core_bundles += 1
+        if parallel_config.world_size > neuron_core_bundles:
             raise ValueError(
-                "The number of required GPUs exceeds the total number of "
-                "available GPUs in the placement group.")
+                "The number of required NeuronCores exceeds the total number of "
+                "available NeuronCores in the placement group.")
     else:
-        num_gpus_in_cluster = ray.cluster_resources().get("GPU", 0)
-        if parallel_config.world_size > num_gpus_in_cluster:
+        num_neuron_cores_in_cluster = ray.cluster_resources().get("neuron_cores", 0)
+        if parallel_config.world_size > num_neuron_cores_in_cluster:
             raise ValueError(
-                "The number of required GPUs exceeds the total number of "
-                "available GPUs in the cluster.")
+                "The number of required NeuronCores exceeds the total number of "
+                "available NeuronCores in the cluster.")
         # Create a new placement group
         current_placement_group = ray.util.placement_group([{
-            "GPU": 1
-        }] * parallel_config.world_size)
+            "neuron_cores": parallel_config.world_size
+        }])
         # Wait until PG is ready - this will block until all
         # requested resources are available, and will timeout
         # if they cannot be provisioned.

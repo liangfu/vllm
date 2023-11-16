@@ -7,6 +7,7 @@ import torch.distributed
 
 from vllm.config import (CacheConfig, ModelConfig, ParallelConfig,
                          SchedulerConfig)
+from vllm.logger import init_logger
 from vllm.model_executor import get_model, InputMetadata, set_random_seed
 from vllm.model_executor.parallel_utils.parallel_state import (
     initialize_model_parallel)
@@ -15,6 +16,7 @@ from vllm.sequence import SamplerOutput, SequenceData, SequenceGroupMetadata
 from vllm.worker.cache_engine import CacheEngine
 from vllm.utils import get_gpu_memory
 
+logger = init_logger(__name__)
 
 class Worker:
     """A worker class that executes (a partition of) the model on a GPU.
@@ -56,7 +58,7 @@ class Worker:
             os.getenv("RANK", "-1"))
         local_rank = int(os.getenv("LOCAL_RANK", "0"))
         # self.device = torch.device(f"cuda:{local_rank}")
-        self.device = xm.xla_device(local_rank)
+        self.device = 'cpu' # xm.xla_device(local_rank)
         if self.rank < 0:
             raise ValueError("Invalid or unspecified rank.")
         # torch.cuda.set_device(self.device)
@@ -67,7 +69,7 @@ class Worker:
 
         # Initialize the model.
         set_random_seed(self.model_config.seed)
-        self.model = get_model(self.model_config)
+        self.model = get_model(self.model_config, self.parallel_config, self.scheduler_config)
 
     @torch.inference_mode()
     def profile_num_available_blocks(
@@ -76,6 +78,15 @@ class Worker:
         gpu_memory_utilization: float,
         cpu_swap_space: int,
     ) -> Tuple[int, int]:
+
+        # Reset the seed to ensure that the random state is not affected by
+        # the model initialization and profiling.
+        set_random_seed(self.model_config.seed)
+        num_gpu_blocks = self.scheduler_config.max_num_seqs
+        num_cpu_blocks = 0
+        return num_gpu_blocks, num_cpu_blocks
+
+
         # Profile the memory usage of the model and get the maximum number of
         # cache blocks that can be allocated with the remaining free memory.
 
@@ -150,8 +161,6 @@ class Worker:
         self,
         seq_group_metadata_list: List[SequenceGroupMetadata],
     ) -> Tuple[torch.Tensor, torch.Tensor, InputMetadata]:
-        import torch_xla.core.xla_model as xm
-
         seq_groups: List[Tuple[List[int], SamplingParams]] = []
         input_tokens: List[int] = []
         input_positions: List[int] = []
@@ -175,10 +184,10 @@ class Worker:
             prompt_len = len(prompt_tokens)
             prompt_lens.append(prompt_len)
 
-            input_tokens.extend(prompt_tokens)
+            input_tokens.append(prompt_tokens)
             # NOTE(woosuk): Here we assume that the first token in the prompt
             # is always the first token in the sequence.
-            input_positions.extend(range(len(prompt_tokens)))
+            input_positions.append(list(range(len(prompt_tokens))))
 
             if seq_group_metadata.block_tables is None:
                 # During memory profiling, the block tables are not initialized
@@ -206,15 +215,31 @@ class Worker:
             seq_ids = list(seq_group_metadata.seq_data.keys())
             sampling_params = seq_group_metadata.sampling_params
             seq_groups.append((seq_ids, sampling_params))
+            max_num_seqs = self.scheduler_config.max_num_seqs
 
+            # print(f"seq_ids: {seq_ids} (max_num_seqs={max_num_seqs})")
+
+            # for seq_id in range(max_num_seqs):
             for seq_id in seq_ids:
+                # if seq_id not in seq_group_metadata.seq_data:
+                #     # Generate dummpy sequences to pad the decoding input
+                #     input_tokens.append([0])
+                #     context_len = 1
+                #     position = 0
+                #     input_positions.append([0])
+                #     if seq_id in seq_group_metadata.block_tables:
+                #         block_table = seq_group_metadata.block_tables[seq_id]
+                #     else:
+                #         block_table = list(seq_group_metadata.block_tables.values())[0]
+                #     generation_block_tables.append(block_table)
+                # else:
                 seq_data = seq_group_metadata.seq_data[seq_id]
                 generation_token = seq_data.get_last_token_id()
-                input_tokens.append(generation_token)
+                input_tokens.append([generation_token])
 
                 context_len = seq_data.get_len()
                 position = context_len - 1
-                input_positions.append(position)
+                input_positions.append([position])
 
                 block_table = seq_group_metadata.block_tables[seq_id]
                 generation_block_tables.append(block_table)
@@ -231,11 +256,11 @@ class Worker:
 
         # Optimization: Pad the input length to be a multiple of 8.
         # This is required for utilizing the Tensor Cores in NVIDIA GPUs.
-        input_tokens = _pad_to_alignment(input_tokens, multiple_of=8)
-        input_positions = _pad_to_alignment(input_positions, multiple_of=8)
+        input_tokens = _pad_to_alignment(input_tokens, multiple_of=1) # 8)
+        input_positions = _pad_to_alignment(input_positions, multiple_of=1) #8)
 
         # Convert to tensors.
-        device = xm.xla_device()
+        device = 'cpu'
         tokens_tensor = torch.tensor(input_tokens,
                                      dtype=torch.long,
                                      device=device)
@@ -307,6 +332,12 @@ class Worker:
         input_tokens, input_positions, input_metadata = self._prepare_inputs(
             seq_group_metadata_list)
 
+        # print(f"input_tokens: {input_tokens}")
+        # print(f"input_positions: {input_positions}")
+        # print(input_metadata)
+        # import pdb
+        # pdb.set_trace()
+
         # Execute the model.
         output = self.model(
             input_ids=input_tokens,
@@ -337,21 +368,25 @@ def _init_distributed_environment(
             "is not already initialized")
     else:
         torch.distributed.init_process_group(
-            # backend="nccl",
             backend="xla",
             world_size=parallel_config.world_size,
             rank=rank,
-            # init_method=distributed_init_method,
         )
 
     # A small all_reduce for warmup.
-    # torch.distributed.all_reduce(torch.zeros(1).cuda())
     initialize_model_parallel(parallel_config.tensor_parallel_size,
                               parallel_config.pipeline_parallel_size)
 
 
 def _pad_to_alignment(x: List[int], multiple_of: int) -> List[int]:
-    return x + [0] * ((-len(x)) % multiple_of)
+    assert isinstance(x[0], list)
+    max_len = len(x[0])
+    for item in x:
+        max_len = max(max_len, len(item))
+    max_len += (-max_len) % multiple_of
+    for idx, item in enumerate(x):
+        x[idx] = x[idx] + [0] * (max_len - len(x[idx]))
+    return x
 
 
 def _pad_to_max(x: List[int], max_len: int) -> List[int]:

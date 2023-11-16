@@ -56,7 +56,7 @@ def _get_model_architecture(config: PretrainedConfig) -> Type[nn.Module]:
         f"Supported architectures: {list(_MODEL_REGISTRY.keys())}")
 
 
-def get_model(model_config: ModelConfig) -> nn.Module:
+def get_model(model_config: ModelConfig, parallel_config, scheduler_config) -> nn.Module:
     model_class = _get_model_architecture(model_config.hf_config)
 
     # Get the quantization config.
@@ -97,7 +97,15 @@ def get_model(model_config: ModelConfig) -> nn.Module:
             initialize_dummy_weights(model)
         else:
             # Load the weights from the cached or downloaded files.
+            from transformers_neuronx.config import NeuronConfig, ContinuousBatchingConfig
+
+            continuous_batching_config = ContinuousBatchingConfig(batch_size_for_shared_caches=scheduler_config.max_num_seqs)
+            neuron_config = NeuronConfig(continuous_batching=continuous_batching_config)
             model.load_weights(model_config.model, model_config.download_dir,
-                               model_config.load_format, model_config.revision)
-            # model = model.cuda()
+                               model_config.load_format, model_config.revision,
+                               tp_degree=parallel_config.tp_degree,
+                               amp='f32', neuron_config=neuron_config,
+                               context_length_estimate=[scheduler_config.max_model_len],
+                               n_positions=[scheduler_config.max_model_len],
+                               batch_size=scheduler_config.max_num_seqs)
     return model.eval()

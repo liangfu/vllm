@@ -1,5 +1,6 @@
 import argparse
 import json
+import os
 from typing import AsyncGenerator
 
 from fastapi import FastAPI, Request
@@ -64,6 +65,15 @@ async def generate(request: Request) -> Response:
 
 
 if __name__ == "__main__":
+    os.environ['MASTER_ADDR'] = 'localhost'
+    os.environ['MASTER_PORT'] = '12355'
+    os.environ['PATH'] = "/home/ubuntu/workspace/vllm/venv/bin:/home/ubuntu/.local/bin:/opt/aws/neuron/bin:/opt/amazon/openmpi/bin/:/opt/amazon/efa/bin/:/opt/aws/neuron/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:/usr/games:/usr/local/games:/snap/bin"
+    os.environ['NEURONX_DUMP_TO'] = os.getcwd()
+
+    os.environ["NEURON_RT_DBG_EMBEDDING_UPDATE_BOUND_CHECK"] = "0"
+    os.environ["NEURON_RT_DBG_INDIRECT_MEMCPY_BOUND_CHECK"] = "0"
+    os.environ["NEURON_CC_FLAGS"]= " -O1 --tensorizer-options=' --no-run-pg-layout-and-tiling ' --internal-backend-options=' --enable-indirect-memcpy-bound-check=false ' "
+
     parser = argparse.ArgumentParser()
     parser.add_argument("--host", type=str, default="localhost")
     parser.add_argument("--port", type=int, default=8000)

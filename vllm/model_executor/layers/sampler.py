@@ -34,17 +34,19 @@ class Sampler(nn.Module):
 
     def forward(
         self,
-        embedding: torch.Tensor,
-        hidden_states: torch.Tensor,
+        # embedding: torch.Tensor,
+        # hidden_states: torch.Tensor,
+        logits: torch.Tensor,
         input_metadata: InputMetadata,
         embedding_bias: Optional[torch.Tensor] = None,
     ) -> SamplerOutput:
-        # Get the hidden states that we use for sampling.
-        hidden_states = _prune_hidden_states(hidden_states, input_metadata)
+        # # Get the hidden states that we use for sampling.
+        # hidden_states = _prune_hidden_states(hidden_states, input_metadata)
+        logits = _prune_logits(logits, input_metadata)
 
-        # Get the logits for the next tokens.
-        logits = _get_logits(hidden_states, embedding, embedding_bias,
-                             self.vocab_size)
+        # # Get the logits for the next tokens.
+        # logits = _get_logits(hidden_states, embedding, embedding_bias,
+        #                      self.vocab_size)
 
         # Apply presence and frequency penalties.
         output_tokens = _get_output_tokens(input_metadata)
@@ -126,6 +128,18 @@ def _prune_hidden_states(
                                           dtype=torch.long,
                                           device=hidden_states.device)
     return hidden_states.index_select(0, all_last_token_indices)
+
+
+def _prune_logits(
+    logits: torch.Tensor,
+    input_metadata: InputMetadata,
+) -> torch.Tensor:
+    all_seq_ids = []
+    for i, seq_group in enumerate(input_metadata.seq_groups):
+        seq_ids, sampling_params = seq_group
+        seq_id = seq_ids[0]
+        all_seq_ids.append(seq_id)
+    return logits[:len(all_seq_ids), :]
 
 
 def _get_penalties(
