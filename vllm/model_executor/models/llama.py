@@ -299,13 +299,13 @@ class LlamaForCausalLM(nn.Module):
                     anchor += input_metadata.prompt_lens[prompt_id]
             else:
                 seq_ids = input_metadata.block_tables
-            print(f"context_lens: {input_metadata.context_lens}")
-            print(f"input_ids: {input_ids}")
-            print(f"cache_ids: {positions}")
-            print(f"seq_ids: {seq_ids}")
+            # print(f"context_lens: {input_metadata.context_lens}")
+            # print(f"input_ids: {input_ids}")
+            # print(f"cache_ids: {positions}")
+            # print(f"seq_ids: {seq_ids}")
             logits = self.model(input_ids, cache_ids=positions, start_ids=seq_ids)
             next_tokens = self.sampler(logits, input_metadata)
-        print(f"next_tokens: {[nt[0].output_token for nt in next_tokens]}")
+        # print(f"next_tokens: {[nt[0].output_token for nt in next_tokens]}")
         # if n_active_tokens == 1:
         #     import pdb
         #     pdb.set_trace()

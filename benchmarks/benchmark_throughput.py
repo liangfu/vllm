@@ -72,6 +72,9 @@ def run_vllm(
         tensor_parallel_size=tensor_parallel_size,
         seed=seed,
         trust_remote_code=trust_remote_code,
+        disable_log_stats=False,
+        # max_num_seqs=256, max_model_len=4096, block_size=4096
+        max_num_seqs=32, max_model_len=1024, block_size=1024
     )
 
     # Add the requests to the engine.
@@ -81,7 +84,7 @@ def run_vllm(
             temperature=0.0 if use_beam_search else 1.0,
             top_p=1.0,
             use_beam_search=use_beam_search,
-            ignore_eos=True,
+            ignore_eos=False, # True,
             max_tokens=output_len,
         )
         # FIXME(woosuk): Do not use internal method.
@@ -160,6 +163,19 @@ def run_hf(
 
 def main(args: argparse.Namespace):
     print(args)
+
+    import os
+    os.environ['MASTER_ADDR'] = 'localhost'
+    os.environ['MASTER_PORT'] = '12355'
+    os.environ['PATH'] = "/home/ubuntu/workspace/vllm/venv/bin:/home/ubuntu/.local/bin:/opt/aws/neuron/bin:/opt/amazon/openmpi/bin/:/opt/amazon/efa/bin/:/opt/aws/neuron/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:/usr/games:/usr/local/games:/snap/bin"
+    os.environ['NEURONX_DUMP_TO'] = os.getcwd()
+
+    os.environ["NEURON_RT_DBG_EMBEDDING_UPDATE_BOUND_CHECK"] = "0"
+    os.environ["NEURON_RT_DBG_INDIRECT_MEMCPY_BOUND_CHECK"] = "0"
+    # os.environ["NEURON_CC_FLAGS"] = " -O1 "
+    # os.environ["NEURON_CC_FLAGS"] = " --tensorizer-options=' --no-run-pg-layout-and-tiling ' "
+    os.environ["NEURON_CC_FLAGS"] = " --internal-backend-options=' --enable-indirect-memcpy-bound-check=false ' "
+
     random.seed(args.seed)
 
     # Sample the requests.
