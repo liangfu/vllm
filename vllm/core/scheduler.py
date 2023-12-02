@@ -165,7 +165,7 @@ class Scheduler:
                 # exceed the maximum number of sequences.
                 num_new_seqs = seq_group.get_max_num_running_seqs()
                 if (num_curr_seqs + num_new_seqs >
-                        self.scheduler_config.max_num_seqs):
+                        self.scheduler_config.max_num_seqs - 1):
                     break
 
                 seq_group = self.waiting.pop(0)
