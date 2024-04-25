@@ -857,6 +857,9 @@ class SpeculativeConfig:
         num_spec_tokens = self.num_speculative_tokens
         return f"SpeculativeConfig({draft_model=}, {num_spec_tokens=})"
 
+    @property
+    def require_compilation(self) -> bool:
+        return self.is_neuron
 
 @dataclass
 class LoRAConfig:

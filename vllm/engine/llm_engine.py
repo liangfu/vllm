@@ -199,6 +199,10 @@ class LLMEngine:
             # different process.
             self.tokenizer.ping()
 
+        # Compile the model if necessary
+        if self.device_config.require_compilation:
+            self._run_workers("compile_model")
+
         # Create the scheduler.
         # NOTE: the cache_config here have been updated with the numbers of
         # GPU and CPU blocks, which are profiled in the distributed executor.

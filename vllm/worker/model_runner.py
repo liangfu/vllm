@@ -209,6 +209,9 @@ class ModelRunner:
                         "but the KV cache data type is not FP8. "
                         "KV cache scaling factors will not be used.")
 
+    def compile_model(self) -> None:
+        self.model.compile_model()
+
     def set_block_size(self, block_size: int) -> None:
         self.block_size = block_size
 

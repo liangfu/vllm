@@ -44,6 +44,7 @@ class NeuronWorker(LoraNotSupportedWorkerBase):
     def load_model(self):
         self.model_runner.load_model()
 
+
     def determine_num_available_blocks(self) -> Tuple[int, int]:
         """Determine the number of available KV blocks.
 
@@ -57,6 +58,36 @@ class NeuronWorker(LoraNotSupportedWorkerBase):
         num_gpu_blocks = self.scheduler_config.max_num_seqs
 
         # Swap not yet supported with Neuron backend.
+
+    def compile_model(self):
+        from transformers_neuronx.config import ContinuousBatchingConfig
+
+        neuron_config = self.model_runner.model.model.neuron_config
+        neuron_config.continuous_batching.init_cache_engine(
+            block_size=self.cache_config.block_size,
+            num_blocks=self.cache_config.num_gpu_blocks
+        )
+        self.model_runner.compile_model()
+        num_cpu_blocks = 0
+
+        return num_gpu_blocks, num_cpu_blocks
+
+    @torch.inference_mode()
+    def profile_num_available_blocks(
+        self,
+        block_size: int = 128,
+        gpu_memory_utilization: float = 0.9,
+        cpu_swap_space: int = 0,
+        cache_dtype: str = "float16",
+    ) -> Tuple[int, int]:
+        """Simply returns max_num_seqs as num_gpu_blocks, 0 as num_cpu_blocks."""
+        total_gpu_memory = self.parallel_config.neuron_tp_degree * 16 * 1e9 # 16GiB per NeuronCore
+        cache_block_size = CacheEngine.get_cache_block_size(
+            block_size, cache_dtype, self.model_config, self.parallel_config)
+        num_gpu_blocks = int(
+            (total_gpu_memory * gpu_memory_utilization) // cache_block_size)
+        num_gpu_blocks = max(num_gpu_blocks, 0)
+        assert num_gpu_blocks > 0, f"insufficient K/V cache space."
         num_cpu_blocks = 0
 
         return num_gpu_blocks, num_cpu_blocks
