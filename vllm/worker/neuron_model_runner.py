@@ -3,6 +3,8 @@ from typing import Dict, List, Optional, Tuple
 import torch
 from torch import nn
 
+from vllm.attention import (AttentionMetadata, AttentionMetadataPerStage,
+                            get_attn_backend)
 from vllm.config import (DeviceConfig, ModelConfig, ParallelConfig,
                          SchedulerConfig)
 from vllm.logger import init_logger
@@ -37,60 +39,146 @@ class NeuronModelRunner:
         self.device = self.device_config.device
         self.pin_memory = is_pin_memory_available()
 
+        self.attn_backend = get_attn_backend(
+            self.model_config.dtype if model_config is not None else None)
+
         # Lazy initialization.
         self.model: nn.Module  # initialize after load_model.
+        self.block_size: int  # Set after initial profiling.
 
     def load_model(self) -> None:
         self.model = get_neuron_model(self.model_config,
                                       parallel_config=self.parallel_config,
                                       scheduler_config=self.scheduler_config)
 
+    def compile_model(self) -> None:
+        self.model.model.to_neuron()
+
+    def set_block_size(self, block_size: int) -> None:
+        self.block_size = block_size
+
     def _prepare_prompt(
         self,
         seq_group_metadata_list: List[SequenceGroupMetadata],
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, List[int]]:
-        assert len(seq_group_metadata_list) > 0
-        input_tokens: List[List[int]] = []
-        input_positions: List[List[int]] = []
-        input_block_ids: List[int] = []
+        input_tokens: List[int] = []
+        input_positions: List[int] = []
+        slot_mapping: List[int] = []
 
         prompt_lens: List[int] = []
+        context_lens: List[int] = []
+        prefix_block_tables: List[List[int]] = []
+
+        if len(seq_group_metadata_list) == 0:
+            return PreparePromptMetadata.empty()
+
         for seq_group_metadata in seq_group_metadata_list:
             assert seq_group_metadata.is_prompt
             seq_ids = list(seq_group_metadata.seq_data.keys())
             assert len(seq_ids) == 1
             seq_id = seq_ids[0]
 
+            computed_block_nums = seq_group_metadata.computed_block_nums
+            if (self.scheduler_config is not None
+                    and self.scheduler_config.chunked_prefill_enabled
+                    and not (computed_block_nums is None
+                             or computed_block_nums == [])):
+                raise RuntimeError(
+                    "chunked prefill cannot be used with prefix caching "
+                    "now.")
+
+            token_chunk_size = seq_group_metadata.token_chunk_size
             seq_data = seq_group_metadata.seq_data[seq_id]
-            prompt_tokens = seq_data.get_token_ids()
-            prompt_len = len(prompt_tokens)
+            computed_len = seq_data.get_num_computed_tokens()
+            # We should use get_len here because in case of preemption
+            # it contains output tokens.
+            prefill_end = min(seq_data.get_len(),
+                              computed_len + token_chunk_size)
+            prompt_tokens = seq_data.get_token_ids()[computed_len:prefill_end]
+            prompt_len = prefill_end
             prompt_lens.append(prompt_len)
 
-            input_tokens.append(prompt_tokens)
-            input_positions.append(list(range(prompt_len)))
+            prefix_block_tables.append([])
+            # Right now, prefill start is always 0. However, this
+            # assumption can be changed once chunked prefill is introduced.
+            assert computed_len == 0
 
-            assert seq_group_metadata.block_tables is not None
+            # actual prompt lens
+            context_lens.append(computed_len)
+
+            input_tokens.extend(prompt_tokens)
+            # NOTE(woosuk): Here we assume that the first token in the prompt
+            # is always the first token in the sequence.
+            input_positions.extend(list(range(computed_len, prefill_end)))
+
+            if seq_group_metadata.block_tables is None:
+                # During memory profiling, the block tables are not initialized
+                # yet. In this case, we just use a dummy slot mapping.
+                slot_mapping.extend([_PAD_SLOT_ID] * prompt_len)
+                continue
+
+            # Compute the slot mapping.
             block_table = seq_group_metadata.block_tables[seq_id]
-            assert len(block_table) == 1
-            input_block_ids.append(block_table[0])
+            # Mask the [0, start_idx) tokens of the prompt with _PAD_SLOT_ID,
+            # where start_idx is max(0, prompt_len - sliding_window).
+            # For example, if the prompt len is 10, sliding window is 8, and
+            # block size is 4, the first two tokens are masked and the slot
+            # mapping will be [-1, -1, 2, 3, 4, 5, 6, 7, 0, 1].
+            start_idx = 0
+
+            for i in range(computed_len, prefill_end):
+                if i < start_idx:
+                    slot_mapping.append(_PAD_SLOT_ID)
+                    continue
+
+                block_number = block_table[i // self.block_size]
+                block_offset = i % self.block_size
+                slot = block_number * self.block_size + block_offset
+                slot_mapping.append(slot)
 
         max_prompt_len = max(prompt_lens)
-        assert max_prompt_len > 0
-        input_tokens = make_tensor_with_pad(input_tokens,
-                                            max_prompt_len,
-                                            pad=0,
-                                            dtype=torch.long,
-                                            device=self.device)
-        input_positions = make_tensor_with_pad(input_positions,
-                                               max_prompt_len,
-                                               pad=0,
-                                               dtype=torch.long,
-                                               device=self.device)
-        input_block_ids = torch.tensor(input_block_ids,
-                                       dtype=torch.long,
-                                       device=self.device)
 
-        return input_tokens, input_positions, input_block_ids, prompt_lens
+        context_lens_tensor = torch.tensor(context_lens,
+                                           dtype=torch.int,
+                                           device=self.device)
+
+        # Prepare prefix block tables
+        max_prompt_block_table_len = max(len(t) for t in prefix_block_tables)
+        block_tables = make_tensor_with_pad(
+            prefix_block_tables,
+            max_len=max_prompt_block_table_len,
+            pad=0,
+            dtype=torch.int,
+            device=self.device,
+        )
+
+        prompt_lens_tensor = torch.tensor(prompt_lens,
+                                          dtype=torch.long,
+                                          device=self.device)
+        seq_start_loc = torch.zeros(prompt_lens_tensor.shape[0] + 1,
+                                    dtype=torch.int32,
+                                    device=self.device)
+
+        torch.cumsum(prompt_lens_tensor,
+                     dim=0,
+                     dtype=seq_start_loc.dtype,
+                     out=seq_start_loc[1:])
+
+        attn_metadata = self.attn_backend.make_metadata(
+            is_prompt=True,
+            prompt_lens=prompt_lens,
+            num_prefills=len(prompt_lens),
+            num_prefill_tokens=sum(prompt_lens),
+            num_decode_tokens=0,
+            prefill_metadata=None,
+            decode_metadata=None,
+            max_context_len=None,
+            context_lens=None,
+            block_tables=torch.tensor([]),
+            slot_mapping=slot_mapping,
+            kv_cache_dtype="auto",
+        )
+        return (input_tokens, input_positions, attn_metadata, prompt_lens)
 
     def _prepare_decode(
         self,
@@ -267,13 +355,13 @@ class NeuronModelRunner:
         self,
         seq_group_metadata_list: List[SequenceGroupMetadata],
     ) -> Optional[SamplerOutput]:
-        (input_tokens, input_positions, input_block_ids, sampling_metadata
+        (input_tokens, input_positions, input_metadata, sampling_metadata
          ) = self.prepare_input_tensors(seq_group_metadata_list)
 
         hidden_states = self.model(
             input_ids=input_tokens,
             positions=input_positions,
-            input_block_ids=input_block_ids,
+            input_metadata=input_metadata,
         )
 
         # Compute the logits.

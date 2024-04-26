@@ -61,6 +61,9 @@ class NeuronExecutor(ExecutorBase):
             seq_group_metadata_list=seq_group_metadata_list)
         return output
 
+    def compile_model(self) -> bool:
+        return self.driver_worker.compile_model()
+
     def add_lora(self, lora_request: LoRARequest) -> bool:
         return self.driver_worker.add_lora(lora_request)
 

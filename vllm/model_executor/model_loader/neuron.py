@@ -54,11 +54,11 @@ class NeuronCasualLM(nn.Module):
         self,
         input_ids: torch.Tensor,
         positions: torch.Tensor,
-        input_block_ids: torch.Tensor,
+        input_metadata,
     ) -> torch.Tensor:
         logits = self.model(input_ids,
                             cache_ids=positions,
-                            start_ids=input_block_ids)
+                            input_metadata=input_metadata)
         return logits
 
     def compute_logits(self, hidden_states: torch.Tensor,
@@ -95,7 +95,6 @@ class NeuronCasualLM(nn.Module):
 
         self.model = neuronx_model_cls.from_pretrained(split_model_dir,
                                                        **kwargs)
-        self.model.to_neuron()
 
 
 def _get_model_architecture(config: PretrainedConfig) -> str:
@@ -112,6 +111,7 @@ def _get_model_architecture(config: PretrainedConfig) -> str:
 def get_neuron_model(model_config: ModelConfig,
                      parallel_config: ParallelConfig,
                      scheduler_config: SchedulerConfig) -> nn.Module:
+    from transformers_neuronx import constants
     from transformers_neuronx.config import (ContinuousBatchingConfig,
                                              NeuronConfig)
 
@@ -121,6 +121,7 @@ def get_neuron_model(model_config: ModelConfig,
     continuous_batching_config = ContinuousBatchingConfig(
         batch_size_for_shared_caches=scheduler_config.max_num_seqs)
     neuron_config = NeuronConfig(
+        cache_layout=constants.Layout.BSH,
         continuous_batching=continuous_batching_config)
 
     # Load the weights from the cached or downloaded files.

@@ -7,7 +7,7 @@ import torch
 
 from vllm.attention.backends.abstract import AttentionBackend
 from vllm.logger import init_logger
-from vllm.utils import is_cpu, is_hip
+from vllm.utils import is_cpu, is_hip, is_neuron
 
 logger = init_logger(__name__)
 
@@ -18,6 +18,7 @@ class _Backend(enum.Enum):
     FLASH_ATTN = enum.auto()
     XFORMERS = enum.auto()
     ROCM_FLASH = enum.auto()
+    NEURON_FLASH = enum.auto()
     TORCH_SDPA = enum.auto()
 
 
@@ -39,6 +40,11 @@ def get_attn_backend(dtype: torch.dtype) -> Type[AttentionBackend]:
         from vllm.attention.backends.rocm_flash_attn import (  # noqa: F401
             ROCmFlashAttentionBackend)
         return ROCmFlashAttentionBackend
+    elif backend == _Backend.NEURON_FLASH:
+        logger.info("Using NeuronFlashAttention backend.")
+        from vllm.attention.backends.neuron_flash_attn import (  # noqa: F401
+            NeuronFlashAttentionBackend)
+        return NeuronFlashAttentionBackend
     elif backend == _Backend.TORCH_SDPA:
         logger.info("Using Torch SDPA backend.")
         from vllm.attention.backends.torch_sdpa import TorchSDPABackend
@@ -51,6 +57,9 @@ def _which_attn_to_use(dtype: torch.dtype) -> _Backend:
     """Returns which flash attention backend to use."""
     if is_cpu():
         return _Backend.TORCH_SDPA
+
+    if is_neuron():
+        return _Backend.NEURON_FLASH
 
     if is_hip():
         # AMD GPUs.
