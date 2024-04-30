@@ -58,6 +58,7 @@ class NeuronCasualLM(nn.Module):
     ) -> torch.Tensor:
         logits = self.model(input_ids,
                             cache_ids=positions,
+                            start_ids=input_metadata.prompt_lens_tensor,
                             input_metadata=input_metadata)
         return logits
 
@@ -119,7 +120,8 @@ def get_neuron_model(model_config: ModelConfig,
     model = NeuronCasualLM(model_config.hf_config)
 
     continuous_batching_config = ContinuousBatchingConfig(
-        batch_size_for_shared_caches=scheduler_config.max_num_seqs)
+        max_model_len=model_config.max_model_len,
+        max_num_seqs=scheduler_config.max_num_seqs)
     neuron_config = NeuronConfig(
         cache_layout=constants.Layout.BSH,
         continuous_batching=continuous_batching_config)

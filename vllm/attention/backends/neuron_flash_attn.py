@@ -59,6 +59,8 @@ class NeuronFlashAttentionMetadata(AttentionMetadata, PagedAttentionMetadata,
     is_prompt: bool
     slot_mapping: torch.Tensor
     prompt_lens: Optional[List[int]]
+    # prompt_lens stored as a tensor.
+    prompt_lens_tensor: Optional[torch.Tensor]
 
     def __post_init__(self):
         # Set during the execution of the first attention op.
