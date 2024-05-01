@@ -159,6 +159,7 @@ class NeuronModelRunner:
         seq_start_loc = torch.zeros(prompt_lens_tensor.shape[0] + 1,
                                     dtype=torch.int32,
                                     device=self.device)
+        slot_mapping = torch.tensor(slot_mapping, dtype=torch.long, device=self.device)
 
         torch.cumsum(prompt_lens_tensor,
                      dim=0,

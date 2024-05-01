@@ -58,7 +58,7 @@ class NeuronCasualLM(nn.Module):
     ) -> torch.Tensor:
         logits = self.model(input_ids,
                             cache_ids=positions,
-                            start_ids=input_metadata.prompt_lens_tensor,
+                            start_ids=input_metadata.slot_mapping,
                             input_metadata=input_metadata)
         return logits
 
