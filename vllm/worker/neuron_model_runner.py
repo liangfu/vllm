@@ -31,6 +31,7 @@ class NeuronModelRunner:
         self.parallel_config = parallel_config
         self.scheduler_config = scheduler_config
 
+        self.sliding_window = None
         if model_config is not None and model_config.get_sliding_window():
             logger.warning("Sliding window is not supported on Neuron. "
                            "The model will run without sliding window.")
@@ -188,49 +189,88 @@ class NeuronModelRunner:
         seq_group_metadata_list: List[SequenceGroupMetadata],
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         assert len(seq_group_metadata_list) > 0
-        input_tokens: List[List[int]] = []
-        input_positions: List[List[int]] = []
-        input_block_ids: List[int] = []
+        input_tokens: List[int] = []
+        input_positions: List[int] = []
+        slot_mapping: List[int] = []
         context_lens: List[int] = []
+        block_tables: List[List[int]] = []
 
         for seq_group_metadata in seq_group_metadata_list:
             assert not seq_group_metadata.is_prompt
+            assert seq_group_metadata.token_chunk_size == 1
 
             seq_ids = list(seq_group_metadata.seq_data.keys())
 
             for seq_id in seq_ids:
                 seq_data = seq_group_metadata.seq_data[seq_id]
                 generation_token = seq_data.get_last_token_id()
-                input_tokens.append([generation_token])
+                input_tokens.append(generation_token)
 
                 seq_len = seq_data.get_len()
                 position = seq_len - 1
-                input_positions.append([position])
-                context_lens.append(seq_len)
+                input_positions.append(position)
 
-                assert seq_group_metadata.block_tables is not None
+                context_len = seq_len if self.sliding_window is None else min(
+                    seq_len, self.sliding_window)
+                context_lens.append(context_len)
+
                 block_table = seq_group_metadata.block_tables[seq_id]
-                assert len(block_table) == 1
-                input_block_ids.append(block_table[0])
+                block_number = block_table[position // self.block_size]
+                block_offset = position % self.block_size
+                slot = block_number * self.block_size + block_offset
+                slot_mapping.append(slot)
 
-        input_tokens = make_tensor_with_pad(input_tokens,
-                                            max_len=1,
-                                            pad=0,
-                                            dtype=torch.long,
-                                            device=self.device)
-        input_positions = make_tensor_with_pad(input_positions,
-                                               max_len=1,
-                                               pad=0,
-                                               dtype=torch.long,
-                                               device=self.device)
+                if self.sliding_window is not None:
+                    sliding_window_blocks = (self.sliding_window //
+                                             self.block_size)
+                    block_table = block_table[-sliding_window_blocks:]
+                block_tables.append(block_table)
+
+        max_context_len = max(context_lens)
+
+        input_tokens = torch.tensor(input_tokens,
+                                    dtype=torch.long,
+                                    device=self.device).unsqueeze(-1)
+        input_positions = torch.tensor(input_positions,
+                                       dtype=torch.long,
+                                       device=self.device).unsqueeze(-1)
+        slot_mapping = torch.tensor(slot_mapping,
+                                    dtype=torch.long,
+                                    device=self.device)
         context_lens = torch.tensor(context_lens,
                                     dtype=torch.int,
                                     device=self.device)
-        input_block_ids = torch.tensor(input_block_ids,
-                                       dtype=torch.long,
-                                       device=self.device)
 
-        return input_tokens, input_positions, input_block_ids
+        max_block_table_len = max(
+            len(block_table) for block_table in block_tables)
+        block_tables = make_tensor_with_pad(
+            block_tables,
+            max_len=max_block_table_len,
+            pad=0,
+            dtype=torch.int,
+            device=self.device,
+        )
+
+        attn_metadata = self.attn_backend.make_metadata(
+            is_prompt=False,
+            slot_mapping=slot_mapping,
+            prompt_lens=None,
+            prompt_lens_tensor=None,
+            num_prefill_tokens=0,
+            num_decode_tokens=len(input_tokens),
+            max_context_len=max_context_len,
+            num_prefills=0,
+            prefill_metadata=None,
+            decode_metadata=None,
+            context_lens=context_lens,
+            block_tables=block_tables,
+            kv_cache_dtype="auto",
+        )
+        return (
+            input_tokens,
+            input_positions,
+            attn_metadata,
+        )
 
     def _prepare_sample(
         self,
