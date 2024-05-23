@@ -121,7 +121,8 @@ def get_neuron_model(model_config: ModelConfig,
 
     continuous_batching_config = ContinuousBatchingConfig(
         max_model_len=model_config.max_model_len,
-        max_num_seqs=scheduler_config.max_num_seqs)
+        max_num_seqs=scheduler_config.max_num_seqs,
+        optimized_paged_attention=True)
     neuron_config = NeuronConfig(
         cache_layout=constants.Layout.BSH,
         continuous_batching=continuous_batching_config)
