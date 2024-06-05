@@ -179,7 +179,7 @@ class NeuronModelRunner:
             context_lens=None,
             block_tables=torch.tensor([]),
             slot_mapping=slot_mapping,
-            kv_cache_dtype="auto",
+            kv_cache_dtype="bfloat16", # "auto", # "auto" means use model weight data type
         )
         input_tokens_tensor = torch.tensor(input_tokens, dtype=torch.long, device=self.device).unsqueeze(0)
         input_positions_tensor = torch.tensor(input_positions, dtype=torch.long, device=self.device).unsqueeze(0)

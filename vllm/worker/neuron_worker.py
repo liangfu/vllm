@@ -50,7 +50,7 @@ class NeuronWorker(LoraNotSupportedWorkerBase):
 
         Swapping is not yet supported, so always return num_cpu_blocks=0.
         """
-        total_gpu_memory = self.parallel_config.tensor_parallel_size * 16 * 1e9 # 16GiB per NeuronCore
+        total_gpu_memory = 16 * 1e9 # 16GiB per NeuronCore
         cache_block_size = CacheEngine.get_cache_block_size(self.cache_config, self.model_config, self.parallel_config)
         num_gpu_blocks = int((total_gpu_memory * self.cache_config.gpu_memory_utilization) // cache_block_size)
         num_gpu_blocks = max(num_gpu_blocks, 0)
@@ -82,8 +82,6 @@ class NeuronWorker(LoraNotSupportedWorkerBase):
             num_blocks=self.cache_config.num_gpu_blocks
         )
 
-        # self.cache_engine = CacheEngine(self.cache_config, self.model_config,
-        #                                 self.parallel_config)
         self.model_runner.set_block_size(self.cache_config.block_size)
         self.model_runner.compile_model()
 
