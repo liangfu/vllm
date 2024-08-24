@@ -1073,6 +1073,13 @@ def cuda_device_count_stateless() -> int:
     return _cuda_device_count_stateless(envs.CUDA_VISIBLE_DEVICES)
 
 
+def device_count_stateless() -> int:
+    if is_cuda() or is_hip():
+        return cuda_device_count_stateless()
+    else:
+        return xla_device_count_stateless()
+
+
 #From: https://stackoverflow.com/a/4104188/2749989
 def run_once(f: Callable[P, None]) -> Callable[P, None]:
 
