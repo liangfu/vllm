@@ -1,8 +1,8 @@
 import os, torch
 os.environ['NEURONX_DUMP_TO'] = os.path.join(os.getcwd(),"_compile_cache")
 # os.environ["NEURON_CC_FLAGS"]= " -O1 --internal-enable-dge-levels=vector_dynamic_offsets "
-os.environ["NEURON_CC_FLAGS"]= " -O3 --internal-enable-dge-levels=vector_dynamic_offsets --disable-internal-io-dge"
-# os.environ["NEURON_CC_FLAGS"]= " -O1 "
+# os.environ["NEURON_CC_FLAGS"]= " -O3 --internal-enable-dge-levels=vector_dynamic_offsets --disable-internal-io-dge"
+os.environ["NEURON_CC_FLAGS"]= " -O1 "
 #  --internal-compiler-debug-mode=penguin --tensorizer-options='--enable-dge-on-indirect-dma' "
 # os.environ["NEURON_CC_FLAGS"] += " --tensorizer-options='--dump-after=All' "
 # os.environ["NEURON_CC_FLAGS"]= " --tensorizer-options='--enable-dge-on-indirect-dma' "

@@ -7,8 +7,7 @@ import torch
 from torch.nn.functional import scaled_dot_product_attention
 
 from vllm.attention.backends.abstract import (AttentionBackend, AttentionImpl,
-                                              AttentionMetadata,
-                                              AttentionMetadataPerStage)
+                                              AttentionMetadata)
 from vllm.attention.ops.paged_attn import (PagedAttention,
                                            PagedAttentionMetadata)
 
@@ -50,17 +49,16 @@ class NeuronFlashAttentionBackend(AttentionBackend):
 
 
 @dataclass
-class NeuronFlashAttentionMetadata(AttentionMetadata, PagedAttentionMetadata,
-                        AttentionMetadataPerStage):
+class NeuronFlashAttentionMetadata(AttentionMetadata, PagedAttentionMetadata):
     """Metadata for NeuronFlashAttentionBackend.
     """
     # Currently, input sequences can only contain all prompts
     # or all decoding. True if all sequences are prompts.
     is_prompt: bool
     slot_mapping: torch.Tensor
-    prompt_lens: Optional[List[int]]
+    seq_lens: Optional[List[int]]
     # prompt_lens stored as a tensor.
-    prompt_lens_tensor: Optional[torch.Tensor]
+    # prompt_lens_tensor: Optional[torch.Tensor]
 
     def __post_init__(self):
         # Set during the execution of the first attention op.
