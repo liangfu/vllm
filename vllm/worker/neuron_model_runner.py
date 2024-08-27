@@ -236,10 +236,12 @@ class NeuronModelRunner(ModelRunnerBase[ModelInputForNeuron]):
             slot_mapping=slot_mapping,
             seq_lens=prompt_lens,
             seq_lens_tensor=torch.tensor([]),
+            prompt_lens_tensor=prompt_lens_tensor,
             max_decode_seq_len=0,
             num_prefills=len(prompt_lens),
             num_prefill_tokens=sum(prompt_lens),
             num_decode_tokens=0,
+            context_lens=None,
             block_tables=torch.tensor([]),
             # kv_cache_dtype=self.kv_cache_dtype, # "auto", # "auto" means use model weight data type
         )
@@ -317,14 +319,13 @@ class NeuronModelRunner(ModelRunnerBase[ModelInputForNeuron]):
         attn_metadata = self.attn_backend.make_metadata(
             is_prompt=False,
             slot_mapping=slot_mapping,
-            prompt_lens=None,
+            seq_lens=None,
+            seq_lens_tensor=torch.tensor([]),
             prompt_lens_tensor=None,
+            max_decode_seq_len=0,
             num_prefill_tokens=0,
             num_decode_tokens=len(input_tokens),
-            max_context_len=max_context_len,
             num_prefills=0,
-            prefill_metadata=None,
-            decode_metadata=None,
             context_lens=context_lens,
             block_tables=block_tables,
             # kv_cache_dtype="auto",
@@ -389,9 +390,7 @@ class NeuronModelRunner(ModelRunnerBase[ModelInputForNeuron]):
         hidden_states = self.model(
             input_ids=model_input.input_tokens,
             positions=model_input.input_positions,
-            input_block_ids=model_input.input_block_ids,
-            **MultiModalInputs.as_kwargs(model_input.multi_modal_kwargs or {},
-                                         device=self.device),
+            input_metadata=model_input.input_block_ids,
         )
 
         # Compute the logits.

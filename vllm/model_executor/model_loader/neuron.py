@@ -57,6 +57,7 @@ class NeuronCasualLM(nn.Module):
         input_metadata,
     ) -> torch.Tensor:
         # print(f"input_ids={input_ids.flatten()}, cache_ids={positions.flatten()}, slot_mapping={input_metadata.slot_mapping.flatten()}, prompt_lens={input_metadata.prompt_lens_tensor}, block_tables={input_metadata.block_tables}")
+        assert self.model.neuron_config.optimized_paged_attention, "invalid paged attention configuration."
         import time
         tic = time.time()
         logits = self.model(input_ids,
