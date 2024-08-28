@@ -127,8 +127,6 @@ _ROCM_PARTIALLY_SUPPORTED_MODELS: Dict[str, str] = {
      "by setting `VLLM_USE_TRITON_FLASH_ATTN=0`")
 }
 
-# Models supported by Neuron.
-_NEURON_SUPPORTED_MODELS = {"LlamaForCausalLM": "neuron.llama", "MistralForCausalLM": "neuron.mistral"}
 
 class ModelRegistry:
 
