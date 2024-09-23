@@ -970,8 +970,6 @@ class SchedulerConfig:
             logger.info(
                 "Chunked prefill is enabled with max_num_batched_tokens=%d.",
                 self.max_num_batched_tokens)
-            import os
-            os.environ["NEURON_CONTEXT_LENGTH_BUCKETS"] = str(self.max_num_batched_tokens)
 
         self.max_num_seqs = max_num_seqs
         self.max_model_len = max_model_len

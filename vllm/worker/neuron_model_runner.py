@@ -533,6 +533,13 @@ class NeuronModelRunner(ModelRunnerBase[ModelInputForNeuron]):
     def compile_model(self) -> None:
         self.model.model.to_neuron()
 
+        # import os
+        # name_or_path = self.model.config._name_or_path
+        # ps_dir = os.path.join("/home/ubuntu/workspace/models", f"{name_or_path}-presharded")
+        # self.model.model.preshared_dir = ps_dir
+        # # on_device_embedding must be True to save and load presharded weights
+        # self.model.model.save(ps_dir, sharded_weights=True)
+
     def set_block_size(self, block_size: int) -> None:
         self.block_size = block_size
 
@@ -614,7 +621,7 @@ class NeuronModelRunner(ModelRunnerBase[ModelInputForNeuron]):
         # Compute the logits.
         logits = self.model.compute_logits(hidden_states,
                                            model_input.sampling_metadata)
-        print("model_input.sampling_metadata", model_input.sampling_metadata)
+        # print("model_input.sampling_metadata", model_input.sampling_metadata)
         # Sample the next token.
         # Before sampling we only keep tokens that are to be sampled (to check if logic is actually correct or not)
         seqs_to_sample = []
@@ -626,7 +633,7 @@ class NeuronModelRunner(ModelRunnerBase[ModelInputForNeuron]):
             logits=logits,
             sampling_metadata=model_input.sampling_metadata,
         )
-        print("output token: ", output)
+        # print("output token: ", output)
         return [output]
 
     @property

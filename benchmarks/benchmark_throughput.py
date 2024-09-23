@@ -218,6 +218,12 @@ def run_mii(
 
 
 def main(args: argparse.Namespace):
+    import os, torch
+    # os.environ['NEURONX_DUMP_TO'] = os.path.join(os.getcwd(),"_compile_cache")
+    os.environ["NEURON_CC_FLAGS"]= " -O1 --internal-hlo2tensorizer-options=--verify-hlo --internal-enable-dge-levels=vector_dynamic_offsets "
+    os.environ["NEURON_RT_DBG_EMBEDDING_UPDATE_BOUND_CHECK"] = "0"
+    os.environ["NEURON_RT_DBG_INDIRECT_MEMCPY_BOUND_CHECK"] = "0"
+
     print(args)
     random.seed(args.seed)
 

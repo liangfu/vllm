@@ -54,12 +54,15 @@ class NeuronCasualLM(nn.Module):
         positions: torch.Tensor,
         input_metadata,
     ) -> torch.Tensor:
-        print(f"input_metadata={input_metadata}")
-        print(f"input_ids={input_ids.flatten()}, cache_ids={positions.flatten()}, slot_mapping={input_metadata.slot_mapping.flatten()}, prompt_lens={input_metadata.seq_lens_tensor}, block_tables={input_metadata.block_tables.flatten()}")
+        # print(f"input_metadata={input_metadata}")
+        # print(f"input_ids={input_ids.flatten()}, cache_ids={positions.flatten()}, slot_mapping={input_metadata.slot_mapping.flatten()}, prompt_lens={input_metadata.seq_lens_tensor}, block_tables={input_metadata.block_tables.flatten()}")
+        import time
+        tic = time.time()
         logits = self.model(input_ids.reshape(1, -1),
                             cache_ids=positions.reshape(1, -1),
                             start_ids=input_metadata.slot_mapping,
                             input_metadata=input_metadata)
+        print(f"elapsed: {(time.time()-tic)*1000.:.2f} ms")
         return logits
 
     def compute_logits(self, hidden_states: torch.Tensor,
@@ -72,11 +75,11 @@ class NeuronCasualLM(nn.Module):
         logits: torch.Tensor,
         sampling_metadata: SamplingMetadata,
     ) -> Optional[SamplerOutput]:
-        print(logits.shape)
-        print(torch.min(logits, dim=1).values.shape)
-        print("logits", logits - torch.min(logits, dim=1, keepdim=True).values)
+        # print(logits.shape)
+        # print(torch.min(logits, dim=1).values.shape)
+        # print("logits", logits - torch.min(logits, dim=1, keepdim=True).values)
         logits_subtract = logits - torch.min(logits, dim=1, keepdim=True).values
-        print("logits max", torch.max(logits_subtract, dim=1))
+        # print("logits max", torch.max(logits_subtract, dim=1))
         next_tokens = self.sampler(logits, sampling_metadata)
         return next_tokens
 
@@ -148,8 +151,8 @@ def get_neuron_model(model_config: ModelConfig,
         optimized_paged_attention=True)
     neuron_config = NeuronConfig(
         fuse_qkv=True,
-        # quant = QuantizationConfig(quant_dtype='s8', dequant_dtype=amp),
-        # weight_tiling=True,
+        quant = QuantizationConfig(quant_dtype='s8', dequant_dtype=amp),
+        weight_tiling=True,
         cache_layout=constants.Layout.BSH,
         attention_layout=constants.Layout.BSH,
         continuous_batching=continuous_batching_config)
@@ -176,9 +179,10 @@ def get_neuron_model(model_config: ModelConfig,
     )
 
     context_length_estimates = _get_buckets("NEURON_CONTEXT_LENGTH_BUCKETS",
-                                            [scheduler_config.max_model_len])
+                                            [scheduler_config.max_num_batched_tokens])
     n_positions = _get_buckets("NEURON_TOKEN_GEN_BUCKETS",
                                [scheduler_config.max_model_len])
+    # [scheduler_config.max_model_len//2, scheduler_config.max_model_len])
 
     # Uncomment below to test bucketing for chunked prefill
     # n_positions = [n_positions[0]//4, n_positions[0]//2, n_positions[0]]
