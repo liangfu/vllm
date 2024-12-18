@@ -45,11 +45,16 @@ class TPUWorker(LoraNotSupportedWorkerBase, LocalOrDistributedWorkerBase):
             self.cache_dtype = STR_DTYPE_TO_TORCH_DTYPE[
                 self.cache_config.cache_dtype]
 
+        # self.model_runner: TPUModelRunner = TPUModelRunner(
+        #     vllm_config=vllm_config, is_driver_worker=is_driver_worker)
+        # remove is_driver_worker for new tpu model runner
         self.model_runner: TPUModelRunner = TPUModelRunner(
-            vllm_config=vllm_config, is_driver_worker=is_driver_worker)
+            vllm_config=vllm_config)
 
     def init_device(self) -> None:
         os.environ["PJRT_DEVICE"] = "TPU"
+        # HACK AOYU Force env = neuron in tpu_worker.py init_device()
+        os.environ['PJRT_DEVICE'] = 'NEURON'
         torch.set_grad_enabled(False)
         torch.set_default_dtype(self.model_config.dtype)
 
@@ -108,12 +113,16 @@ class TPUWorker(LoraNotSupportedWorkerBase, LocalOrDistributedWorkerBase):
                       torch.tensor([], dtype=torch.float32,
                                    device=self.device))
                      for _ in range(num_layers)]
-        self.model_runner._dummy_run(
-            batch_size=1,
-            seq_len=self.scheduler_config.max_num_batched_tokens,
-            kv_caches=kv_caches,
-            exec_mode=ExecutionMode.PREFILL,
-        )
+        # HACK AOYU by pass dummpy run for determing available blocks
+        # self.model_runner._dummy_run(
+        #     batch_size=1,
+        #     seq_len=self.scheduler_config.max_num_batched_tokens,
+        #     kv_caches=kv_caches,
+        #     exec_mode=ExecutionMode.PREFILL,
+        # )
+
+        # HACK AOYU return fake tpu_blocks, cpu_blocks in determine_num_available_blocks()
+        return 5,0
         # Synchronize before measuring the memory usage.
         xm.wait_device_ops()
 

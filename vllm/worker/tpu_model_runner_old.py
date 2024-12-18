@@ -818,39 +818,39 @@ class ModelWrapper(nn.Module):
             num_prompts=attn_metadata.num_prefills,
         )
 
-        # Skip this in memory profiling at initialization.
-        if kv_caches[0][0].numel() > 0:
-            # index_copy_(slot_mapping) only works when the inserted dimension
-            # is 0. However, the KV cache in the Pallas backend has the shape
-            # [num_kv_heads, num_blocks, block_size, head_size]. To make it
-            # work, we need to flatten the first three dimensions and modify
-            # the slot_mapping accordingly.
-            num_kv_heads, num_blocks, block_size, _ = kv_caches[0][0].shape
-            slot_mapping = attn_metadata.slot_mapping
-            slot_mapping = slot_mapping.flatten()
-            head_indicies = torch.arange(0,
-                                         num_kv_heads,
-                                         device=slot_mapping.device,
-                                         dtype=slot_mapping.dtype)
-            head_indicies *= block_size * num_blocks
-            slot_mapping = slot_mapping.repeat_interleave(num_kv_heads).view(
-                -1, num_kv_heads)
-            slot_mapping = slot_mapping + head_indicies.view(1, -1)
-            slot_mapping = slot_mapping.flatten()
-            attn_metadata.slot_mapping = slot_mapping
+        # # Skip this in memory profiling at initialization.
+        # if kv_caches[0][0].numel() > 0:
+        #     # index_copy_(slot_mapping) only works when the inserted dimension
+        #     # is 0. However, the KV cache in the Pallas backend has the shape
+        #     # [num_kv_heads, num_blocks, block_size, head_size]. To make it
+        #     # work, we need to flatten the first three dimensions and modify
+        #     # the slot_mapping accordingly.
+        #     num_kv_heads, num_blocks, block_size, _ = kv_caches[0][0].shape
+        #     slot_mapping = attn_metadata.slot_mapping
+        #     slot_mapping = slot_mapping.flatten()
+        #     head_indicies = torch.arange(0,
+        #                                  num_kv_heads,
+        #                                  device=slot_mapping.device,
+        #                                  dtype=slot_mapping.dtype)
+        #     head_indicies *= block_size * num_blocks
+        #     slot_mapping = slot_mapping.repeat_interleave(num_kv_heads).view(
+        #         -1, num_kv_heads)
+        #     slot_mapping = slot_mapping + head_indicies.view(1, -1)
+        #     slot_mapping = slot_mapping.flatten()
+        #     attn_metadata.slot_mapping = slot_mapping
 
-        # hidden_states = self.model(
-        #     token_ids,
-        #     position_ids,
-        #     kv_caches,
-        #     attn_metadata,
-        # )
-        # HACK AOYU add fake hidden state to bypass attention calculation
-        hidden_states = fake_hidden_states
+        # # hidden_states = self.model(
+        # #     token_ids,
+        # #     position_ids,
+        # #     kv_caches,
+        # #     attn_metadata,
+        # # )
+        # # HACK AOYU add fake hidden state to bypass model calculation
+        # hidden_states = fake_hidden_states
         hidden_states = hidden_states.flatten(0, 1)
         logits = self.model.compute_logits(hidden_states, sampling_metadata)
 
-        # HACK AOYU only use greddy sampling, refer to tpu_model_runner_v1
+        # logits = fake_logits
         # # Greedy sampling.
         # argmax_token_ids = torch.argmax(logits, dim=-1, keepdim=True)
         _, argmax_token_ids = torch.max(logits, dim=-1, keepdim=True)

@@ -1,12 +1,15 @@
 import glob
 import os
+# HACK
+os.environ["NEURON_CC_FLAGS"]= " --model-type=transformer -O1 --internal-hlo2tensorizer-options='--verify-hlo' --retry_failed_compilation "
 import tempfile
 
 import depyf
 
-from vllm.config import CompilationLevel
+from vllm.config import CompilationLevel, ModelConfig
 
 temp_dir = tempfile.mkdtemp()
+print(f"temp dir for depyfy debug is {temp_dir}")
 with depyf.prepare_debug(temp_dir):
     from vllm import LLM, SamplingParams
 
@@ -32,7 +35,11 @@ with depyf.prepare_debug(temp_dir):
 
     # disable custom dispatcher, let Dynamo takes over
     # all the control
-    llm = LLM(model="google/gemma-2b",
+
+    # llm = LLM(model="google/gemma-2b",
+    # llm = LLM(model="nickypro/tinyllama-42M",
+    llm = LLM(model="TinyLlama/TinyLlama_v1.1",
+            #   hf_overrides={"vocab_size":320},
               enforce_eager=True,
               compilation_config={"level": CompilationLevel.DYNAMO_AS_IS})
     outputs = llm.generate(prompts, sampling_params)
