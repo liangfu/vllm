@@ -5,6 +5,8 @@ kernels - Builtin high performance attention kernels
 
 """
 
+import torch
+
 from dataclasses import dataclass
 
 import neuronxcc.nki.isa as nisa
@@ -12,6 +14,7 @@ import neuronxcc.nki.language as nl
 import numpy as np
 from neuronxcc import nki
 from neuronxcc.nki.language import par_dim
+from torch_neuronx import nki_jit
 
 
 @dataclass(frozen=True)
@@ -636,3 +639,224 @@ def flash_paged_attention(
     if return_debug_tensors:
         return o, hbm_m_buffer, hbm_l_buffer, hbm_qk_res
     return o
+
+
+def context_attention_fwd(
+    query,
+    key,
+    value,
+    key_cache,
+    value_cache,
+    block_table,
+    attn_mask,
+    n_kv_head = None,
+    head_size = None,
+    B_P_SIZE = 128,
+    LARGE_TILE_SZ = 2048,
+    simulate=False,
+    return_debug_tensors=False,
+    mixed_precision=True,
+):
+    import neuronxcc.nki as nki
+
+    # _, n_kv_head, head_size, _ = key.shape
+    # assert value.shape[-1] == head_size, "invalid input shape"
+    config = FlashConfig(
+        seq_tile_size=LARGE_TILE_SZ,
+        training=False,
+        should_transpose_v=False,
+    )
+    kwargs = dict(
+        query=query,
+        key=key,
+        value=value,
+        key_cache=key_cache,
+        value_cache=value_cache,
+        block_tables=block_table,
+        mask=attn_mask,
+        softmax_scale=1.0 / (head_size**0.5),
+        config=config,
+        mixed_precision=mixed_precision,
+        return_debug_tensors=return_debug_tensors,
+    )
+
+    def _run_kernel(func, **kwargs):
+        if simulate:
+            return nki.simulate_kernel(func, **kwargs)
+        else:
+            return func(**kwargs)
+
+    if simulate:
+        kwargs.update(query=query.cpu().numpy())
+        kwargs.update(key=key.cpu().numpy())
+        kwargs.update(value=value.cpu().numpy())
+        kwargs.update(key_cache=key_cache.cpu().numpy())
+        kwargs.update(value_cache=value_cache.cpu().numpy())
+        kwargs.update(block_tables=block_table.cpu().numpy())
+        kwargs.update(mask=attn_mask.cpu().numpy())
+
+    if return_debug_tensors:
+        o, *debug_tensors = _run_kernel(
+            flash_paged_attention[1, n_kv_head], **kwargs)
+        return o, *debug_tensors
+    else:
+        # o = _run_kernel(flash_paged_attention[1, n_kv_head], **kwargs)
+        o = flash_paged_attention[1, n_kv_head](**kwargs)
+        return o
+
+
+def nki_context_attention(
+        query, key, value, key_cache, value_cache,
+        query_lens, seq_lens,
+        batch_size,
+        block_size,
+        max_model_len,
+        simulate = False,
+        return_debug_tensors = False,
+        mixed_precision = True,
+):
+    # build neuron program
+    B_P_SIZE = 128
+    LARGE_TILE_SZ = 2048
+    max_num_seqs = batch_size
+    n_blocks = (max_model_len * max_num_seqs) // block_size
+    max_num_queries = (
+        (sum(query_lens) + block_size - 1) // block_size) * block_size
+
+    def get_active_block_tables(block_tables, query_lens, seq_lens, block_size,
+                                num_blocks):
+        context_lens = seq_lens - query_lens
+        blocks_per_seq = (context_lens + block_size - 1) // block_size
+        num_seqs = len(seq_lens)
+        active_blocks: list[int] = []
+        for seq_id in range(num_seqs):
+            active_blocks = (
+                active_blocks +
+                block_tables[seq_id, :blocks_per_seq[seq_id]].tolist())
+        return F.pad(
+            torch.tensor(active_blocks),
+            (0, num_blocks - len(active_blocks)),
+            "constant",
+            0,
+        )
+
+    def shift_bit_length(x):
+        return 1 << (x - 1).bit_length()
+
+    # Build and pad input tensors
+    max_num_queries_shifted = shift_bit_length(max_num_queries)
+    max_num_queries_factor = B_P_SIZE // max_num_queries_shifted
+    max_num_queries_padded = max_num_queries_shifted * max_num_queries_factor
+    assert (max_num_queries_padded == B_P_SIZE
+            ), "invalid {max_num_queries_padded=}"
+    head_size_padded = B_P_SIZE
+    context_lens = torch.tensor(seq_lens) - torch.tensor(query_lens)
+    num_active_blocks_shifted = shift_bit_length(
+        ((context_lens + block_size - 1) // block_size).sum().item())
+    num_active_blocks_factor = (LARGE_TILE_SZ // block_size //
+                                num_active_blocks_shifted)
+    num_active_blocks = num_active_blocks_shifted * num_active_blocks_factor
+    assert (num_active_blocks *
+            block_size) == LARGE_TILE_SZ, "invalid {num_active_blocks=}"
+    pad_dims = (
+        0,
+        head_size_padded - query.shape[2],
+        0,
+        0,
+        0,
+        max_num_queries_padded - query.shape[0],
+    )
+    query = F.pad(query, pad_dims, "constant", 0)
+    k = F.pad(k, pad_dims, "constant", 0)
+    v = F.pad(v, pad_dims, "constant", 0)
+    output_ref_padded = F.pad(
+        output_ref,
+        (0, 0, 0, 0, 0, 0, 0, max_num_queries_padded - output_ref.shape[0]),
+        "constant",
+        0,
+    )
+    active_block_table = get_active_block_tables(
+        block_table,
+        torch.tensor(query_lens),
+        torch.tensor(seq_lens),
+        block_size,
+        num_active_blocks,
+    )
+    k_cache = F.pad(k_cache, (0, head_size_padded - head_size), "constant", 0)
+    v_cache = F.pad(v_cache, (0, head_size_padded - head_size), "constant", 0)
+
+    # Build attention masks
+    import torch_xla.core.xla_model as xm
+
+    device = xm.xla_device()
+    prior_mask, active_mask = (
+        BlockDiagonalCausalFromBottomRightMask.from_seqlens(
+            query_lens, seq_lens, block_size=block_size))
+    context_kv_len = num_active_blocks * block_size
+    assert context_kv_len == LARGE_TILE_SZ, f"invalid {context_kv_len=}"
+    attn_mask = torch.concat(
+        [
+            F.pad(
+                prior_mask,
+                (
+                    0,
+                    context_kv_len - prior_mask.shape[1],
+                    0,
+                    B_P_SIZE - prior_mask.shape[0],
+                ),
+                "constant",
+                0,
+            ).bool(),
+            F.pad(
+                active_mask,
+                (
+                    0,
+                    B_P_SIZE - active_mask.shape[1],
+                    0,
+                    B_P_SIZE - active_mask.shape[0],
+                ),
+                "constant",
+                0,
+            ).bool(),
+        ],
+        dim=1,
+    )
+
+    example = (
+        # query: shape (1, n_heads, d, seq_q)
+        # key:   shape (1, n_kv_heads, d, seq_k)
+        # value: shape (1, n_kv_heads, seq_v, d)
+        query.unsqueeze(1).transpose(0, 1).permute(
+            0, 2, 3, 1).contiguous().to(device=device),
+        k.unsqueeze(1).transpose(0,
+                                 1).permute(0, 2, 3,
+                                            1).contiguous().to(device=device),
+        v.unsqueeze(1).transpose(0,
+                                 1).permute(0, 2, 1,
+                                            3).contiguous().to(device=device),
+        k_cache.to(device=device),
+        v_cache.to(device=device),
+        active_block_table.to(torch.int32).to(device=device),
+        attn_mask.to(device=device),
+    )
+
+    if return_debug_tensors:
+        output_nki, *debug_tensors = context_attention_fwd(*example,
+                                                           simulate=simulate)
+    else:
+        output_nki = context_attention_fwd(*example, simulate=simulate)
+        debug_tensors = []
+    if simulate:
+        output_nki = torch.tensor(output_nki)
+        debug_tensors = [torch.tensor(dt) for dt in debug_tensors]
+    else:
+        output_nki = torch.tensor(output_nki).cpu()
+        debug_tensors = [torch.tensor(dt).cpu() for dt in debug_tensors]
+
+    n_queries = sum(query_lens)
+
+    # - o: shape (bs, n_heads, seq_q, d) -> (bs, seq_q, n_heads, d)
+    output_nki = output_nki.permute(
+        0, 2, 1, 3)[:, :, :, :head_size].cpu()[0, :n_queries, :, :]
+
+    return output_nki
