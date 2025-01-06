@@ -23,6 +23,7 @@ from vllm.v1.outputs import ModelRunnerOutput
 from vllm.v1.sample.metadata import SamplingMetadata
 import torch_xla.runtime as xr
 from unittest.mock import patch
+from vllm.config import set_current_vllm_config
 
 if TYPE_CHECKING:
     from vllm.v1.core.scheduler import SchedulerOutput
@@ -720,7 +721,8 @@ class NeuronModelRunner:
         model = get_model(vllm_config=self.vllm_config)
         model = model.eval()
         xm.wait_device_ops()
-        self.model = ModelWrapper(model)
+        with set_current_vllm_config(self.vllm_config):
+            self.model = ModelWrapper(model)
 
     def _dummy_run(self, batch_size: int, seq_len: int,
                    kv_caches: List[torch.Tensor], is_prompt: bool) -> None:
