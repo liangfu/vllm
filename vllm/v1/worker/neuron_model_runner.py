@@ -21,6 +21,8 @@ from vllm.v1.attention.backends.neuron_attn import (NeuronAttentionBackend,
                                                NeuronAttentionMetadata, BlockDiagonalCausalFromBottomRightMask)
 from vllm.v1.outputs import ModelRunnerOutput
 from vllm.v1.sample.metadata import SamplingMetadata
+from vllm.v1.worker.gpu_input_batch import CachedRequestState, InputBatch
+
 import torch_xla.runtime as xr
 from unittest.mock import patch
 from vllm.config import set_current_vllm_config
@@ -36,29 +38,6 @@ _PAD_SLOT_ID = 1_000_000_000
 # build neuron program
 B_P_SIZE = 128
 LARGE_TILE_SZ = 2048
-
-
-@dataclass
-class PrefillInputData:
-
-    request_ids: List
-    prompt_lens: List
-    token_ids: List
-    position_ids: List
-    attn_metadata: List
-
-    def zipped(self):
-        return zip(self.request_ids, self.prompt_lens, self.token_ids,
-                   self.position_ids, self.attn_metadata)
-
-
-@dataclass
-class DecodeInputData:
-
-    num_decodes: int
-    token_ids: Optional[torch.Tensor] = None
-    position_ids: Optional[torch.Tensor] = None
-    attn_metadata: NeuronAttentionMetadata = None
 
 
 class NeuronModelRunner:
@@ -213,388 +192,131 @@ class NeuronModelRunner:
             req_state = self.requests[req_id]
             self.input_batch.add_request(req_state, None)
 
-    def _prepare_prefill_inputs(
-        self,
-        num_scheduled_tokens: List[int],
-    ) -> PrefillInputData:
-        # Each prefill run separately with shape [1, padded_prompt_len].
-        # So we create lists that will be used in execute_model().
 
-        prefill_request_ids = []
-        prefill_prompt_lens = []
-        prefill_token_ids = []
-        prefill_position_ids = []
-        prefill_attn_metadata = []
-
-        # DECODES are the first num_decodes REQUESTS.
-        # PREFILLS are the next num_reqs - num_decodes REQUESTS.
-        num_reqs = self.input_batch.num_reqs
-        num_decodes = self.input_batch.num_decodes
-        block_size = self.block_size
-        for idx in range(num_decodes, num_reqs):
-            prefill_request_ids.append(self.input_batch.req_ids[idx])
-
-            # STATIC SHAPE: prefills are padded to the next power of 2.
-            prompt_len = num_scheduled_tokens[idx]
-            padded_prompt_len = _get_padded_prefill_len(prompt_len)
-            prefill_prompt_lens.append(prompt_len)
-            assert padded_prompt_len <= self.max_model_len
-
-            # TOKEN_IDS.
-            token_ids = torch.from_numpy(self.input_batch.token_ids_cpu[
-                idx, :padded_prompt_len].reshape(1, -1))
-            prefill_token_ids.append(token_ids.to(self.device))
-
-            # POSITIONS.
-            positions = self.prefill_positions[:, :padded_prompt_len]
-            prefill_position_ids.append(positions.to(self.device))
-
-            # SLOT_MAPPING.
-            # The "slot" is the "physical index" of a token in the KV cache.
-            # Look up the block_idx in the block table (logical<>physical map)
-            # to compute this.
-            block_numbers = self.input_batch.block_table_cpu_tensor[
-                idx, positions // self.block_size].reshape(1, -1)
-            block_offsets = positions % self.block_size
-            slot_mapping = block_numbers * self.block_size + block_offsets
-            # Set an out of range value for the padding tokens so that they
-            # are ignored when inserting into the KV cache.
-            slot_mapping[:, prompt_len:] = _PAD_SLOT_ID
-            slot_mapping = slot_mapping.long()
-
-            # HACK AOYU remove dependancy on kv cache in the future
-            num_active_blocks = LARGE_TILE_SZ // block_size
-            context_kv_len = num_active_blocks * block_size
-            # FIXME AOYU should query_lens be prompt len or padded promt len
-            query_lens = [padded_prompt_len]
-            seq_lens = query_lens
-
-            prior_mask, active_mask = (
-            BlockDiagonalCausalFromBottomRightMask.from_seqlens(query_lens, seq_lens, block_size=block_size))
-
-            attn_mask = torch.concat(
-                [
-                    F.pad(
-                        prior_mask,
-                        (
-                            0,
-                            context_kv_len - prior_mask.shape[1],
-                            0,
-                            B_P_SIZE - prior_mask.shape[0],
-                        ),
-                        "constant",
-                        0,
-                    ).bool(),
-                    F.pad(
-                        active_mask,
-                        (
-                            0,
-                            B_P_SIZE - active_mask.shape[1],
-                            0,
-                            B_P_SIZE - active_mask.shape[0],
-                        ),
-                        "constant",
-                        0,
-                    ).bool(),
-                ],
-                dim=1,
-            )
-
-
-
-            # ATTN_METADATA.
-            prefill_attn_metadata.append(
-                NeuronAttentionMetadata(
-                    is_prompt=True,
-                    slot_mapping=slot_mapping.to(self.device),
-                    block_tables=None,
-                    context_lens=None,
-                    active_block_table=None,
-                    attn_mask=attn_mask.to(self.device)
-                ))
-
-
-        return PrefillInputData(
-            request_ids=prefill_request_ids,
-            prompt_lens=prefill_prompt_lens,
-            token_ids=prefill_token_ids,
-            position_ids=prefill_position_ids,
-            attn_metadata=prefill_attn_metadata,
-        )
-
-    def _prepare_decode_inputs(self, num_decodes: int) -> DecodeInputData:
-        # Decodes run as one single padded batch with shape [batch, 1]
-        #
-        # We need to set _PAD_SLOT_ID for the padding tokens in the
-        # slot_mapping, such that the attention KV cache insertion
-        # logic knows to ignore those indicies. Otherwise, the
-        # padding data can be dummy since we have a causal mask.
-
-        if num_decodes == 0:
-            return DecodeInputData(num_decodes=0)
-
-        # PAD FOR STATIC SHAPES.
-        padded_batch_size = _get_padded_batch_size(num_decodes)
-
-        # POSITIONS. [batch, 1]
-        # We slice at the end, since we use the positions for gathering.
-        positions = torch.from_numpy(
-            self.input_batch.num_computed_tokens_cpu.reshape(-1, 1))
-        index = positions.to(torch.int64)
-        positions = positions[:padded_batch_size]
-
-        # TOKEN_IDS. [batch, 1]
-        token_ids = torch.gather(
-            input=torch.from_numpy(self.input_batch.token_ids_cpu),
-            dim=1,
-            index=index,
-        )[:padded_batch_size]
-
-        # SLOT_MAPPING [batch, 1]
-        # The "slot" is the "physical index" of a token in the KV cache.
-        # Look up the block_idx in the block table (logical<>physical map)
-        # to compute this.
-        block_number = torch.gather(
-            input=self.input_batch.block_table_cpu_tensor,
-            dim=1,
-            index=(index // self.block_size))
-        block_offsets = index % self.block_size
-        slot_mapping = block_number * self.block_size + block_offsets
-        # Set an out of range value for the padding tokens so that they
-        # are ignored when inserting into the KV cache.
-        slot_mapping[num_decodes:] = _PAD_SLOT_ID
-        slot_mapping = slot_mapping[:padded_batch_size]
-
-        # BLOCK_TABLE [batch, max_num_blocks_per_req]
-        block_table = self.input_batch.block_table_cpu_tensor[:
-                                                              padded_batch_size]
-
-        # CONTEXT_LENS [batch_size]
-        # context_lens = (positions.reshape(-1) + 1)
-        context_lens = positions.reshape(-1)
-
-        query_lens = [1 for _ in range(num_decodes)] + [0] * (padded_batch_size - num_decodes)
-        # seq_lens = [c + 1 for c in list(context_lens)]
-        seq_lens = [a + b for a,b in zip(query_lens, context_lens)]
-
-        def get_active_block_tables(block_tables, query_lens, seq_lens, block_size,
-                                    num_blocks):
-            context_lens = seq_lens - query_lens
-            blocks_per_seq = (context_lens + block_size - 1) // block_size
-            num_seqs = len(seq_lens)
-            active_blocks: list[int] = []
-            for seq_id in range(num_seqs):
-                active_blocks = (
-                    active_blocks +
-                    block_tables[seq_id, :blocks_per_seq[seq_id]].tolist())
-                if seq_lens[seq_id] == 0:
-                    break
-            return F.pad(
-                torch.tensor(active_blocks),
-                (0, num_blocks - len(active_blocks)),
-                "constant",
-                0,
-            )
-        
-                # Build and pad input tensors
-        def shift_bit_length(x):
-            return 1 << (x - 1).bit_length()
-
-        block_size = self.block_size
-        max_num_queries = (
-            (sum(query_lens) + block_size - 1) // block_size) * block_size
-        max_num_queries_shifted = shift_bit_length(max_num_queries)
-        max_num_queries_factor = B_P_SIZE // max_num_queries_shifted
-        max_num_queries_padded = max_num_queries_shifted * max_num_queries_factor
-
-        assert (max_num_queries_padded == B_P_SIZE
-                ), "invalid {max_num_queries_padded=}"
-        context_lens = torch.tensor(seq_lens) - torch.tensor(query_lens)
-        num_active_blocks_shifted = shift_bit_length(
-            ((context_lens + block_size - 1) // block_size).sum().item())
-        num_active_blocks_factor = (LARGE_TILE_SZ // block_size //
-                                    num_active_blocks_shifted)
-        num_active_blocks = num_active_blocks_shifted * num_active_blocks_factor
-
-        assert (num_active_blocks *
-                block_size) == LARGE_TILE_SZ, "invalid {num_active_blocks=}"
-        
-
-        active_block_table = get_active_block_tables(
-            block_table,
-            torch.tensor(query_lens),
-            torch.tensor(seq_lens),
-            self.block_size,
-            num_active_blocks,
-        )
-
-        context_kv_len = num_active_blocks * block_size
-        assert context_kv_len == LARGE_TILE_SZ, f"invalid {context_kv_len=}"
-        prior_mask, active_mask = (
-            BlockDiagonalCausalFromBottomRightMask.from_seqlens(query_lens, seq_lens, block_size=block_size))
-
-        attn_mask = torch.concat(
-            [
-                F.pad(
-                    prior_mask,
-                    (
-                        0,
-                        context_kv_len - prior_mask.shape[1],
-                        0,
-                        B_P_SIZE - prior_mask.shape[0],
-                    ),
-                    "constant",
-                    0,
-                ).bool(),
-                F.pad(
-                    active_mask,
-                    (
-                        0,
-                        B_P_SIZE - active_mask.shape[1],
-                        0,
-                        B_P_SIZE - active_mask.shape[0],
-                    ),
-                    "constant",
-                    0,
-                ).bool(),
-            ],
-            dim=1,
-        )
-
-        # CPU<>TPU sync happens here.
-        return DecodeInputData(num_decodes=num_decodes,
-                               token_ids=token_ids.to(self.device),
-                               position_ids=positions.to(self.device),
-                               attn_metadata=NeuronAttentionMetadata(
-                                is_prompt=False,
-                                slot_mapping=slot_mapping.to(self.device),
-                                block_tables=block_table.to(self.device),
-                                context_lens=context_lens.to(self.device),
-                                active_block_table=active_block_table.to(torch.int32).to(self.device),
-                                attn_mask=attn_mask.to(self.device)
-                               ))
-
-    def _prepare_inputs(
-        self, scheduler_output: "SchedulerOutput"
-    ) -> Tuple[PrefillInputData, Optional[DecodeInputData]]:
-
+    def _prepare_inputs(self, scheduler_output: "SchedulerOutput"):
         total_num_scheduled_tokens = scheduler_output.total_num_scheduled_tokens
         assert total_num_scheduled_tokens > 0
-
-        # Get active block tables
-        block_table = self.input_batch.block_table
-        block_size = self.block_size
-
-
         num_reqs = self.input_batch.num_reqs
-        num_decodes = self.input_batch.num_decodes
+        assert num_reqs > 0
+
+        # OPTIMIZATION: Start copying the block table first.
+        # This way, we can overlap the copy with the following CPU operations.
+        self.input_batch.block_table.commit(num_reqs)
 
         # Get the number of scheduled tokens for each request.
         # TODO: The Python loop can be slow. Optimize.
         num_scheduled_tokens = []
-        for idx, req_id in enumerate(self.input_batch.req_ids[:num_reqs]):
+        max_num_scheduled_tokens = 0
+        for req_id in self.input_batch.req_ids[:num_reqs]:
+            assert req_id is not None
             num_tokens = scheduler_output.num_scheduled_tokens[req_id]
             num_scheduled_tokens.append(num_tokens)
+            max_num_scheduled_tokens = max(max_num_scheduled_tokens,
+                                           num_tokens)
+        num_scheduled_tokens = np.array(num_scheduled_tokens, dtype=np.int32)
+        assert max_num_scheduled_tokens > 0
 
-            # NOTE: assert that all the decodes are "decodes".
-            if idx < num_decodes:
-                assert num_tokens == 1
-        
-        # query_lens = num_scheduled_tokens
-        # key_cache, _ = self.kv_caches[0]
-        # num_blocks, block_size, _, _ = key_cache.shape
-        # seq_lens = [num_blocks*block_size for _ in range(len(query_lens))]
+        # Get request indices.
+        # E.g., [2, 5, 3] -> [0, 0, 1, 1, 1, 1, 1, 2, 2, 2]
+        req_indices = np.repeat(self.arange_np[:num_reqs],
+                                num_scheduled_tokens)
 
-        # # Build and pad input tensors
-        # def shift_bit_length(x):
-        #     return 1 << (x - 1).bit_length()
+        # Get batched arange.
+        # E.g., [2, 5, 3] -> [0, 1, 0, 1, 2, 3, 4, 0, 1, 2]
+        arange = np.concatenate(
+            [self.arange_np[:n] for n in num_scheduled_tokens])
 
-        # max_num_queries = (
-        #     (sum(query_lens) + block_size - 1) // block_size) * block_size
-        # max_num_queries_shifted = shift_bit_length(max_num_queries)
-        # max_num_queries_factor = B_P_SIZE // max_num_queries_shifted
-        # max_num_queries_padded = max_num_queries_shifted * max_num_queries_factor
+        # Get positions.
+        positions_np = self.positions_np[:total_num_scheduled_tokens]
+        np.add(self.input_batch.num_computed_tokens_cpu[req_indices],
+               arange,
+               out=positions_np)
 
-        # assert (max_num_queries_padded == B_P_SIZE
-        #         ), "invalid {max_num_queries_padded=}"
-        # head_size_padded = B_P_SIZE
-        # context_lens = torch.tensor(seq_lens) - torch.tensor(query_lens)
-        # num_active_blocks_shifted = shift_bit_length(
-        #     ((context_lens + block_size - 1) // block_size).sum().item())
-        # num_active_blocks_factor = (LARGE_TILE_SZ // block_size //
-        #                             num_active_blocks_shifted)
-        # num_active_blocks = num_active_blocks_shifted * num_active_blocks_factor
-        # assert (num_active_blocks *
-        #         block_size) == LARGE_TILE_SZ, "invalid {num_active_blocks=}"
+        # Get token indices.
+        # E.g., [0, 1, 0, 1, 2, 3, 4, 0, 1, 2]
+        # -> [0, 1, M, M + 1, M + 2, M + 3, M + 4, 2 * M, 2 * M + 1, 2 * M + 2]
+        # where M is the max_model_len.
+        token_indices = (positions_np +
+                         req_indices * self.input_batch.token_ids_cpu.shape[1])
+        # NOTE(woosuk): We use torch.index_select instead of np.take here
+        # because torch.index_select is much faster than np.take for large
+        # tensors.
+        torch.index_select(self.input_batch.token_ids_cpu_tensor.flatten(),
+                           0,
+                           torch.from_numpy(token_indices),
+                           out=self.input_ids_cpu[:total_num_scheduled_tokens])
 
+        # Calculate the slot mapping.
+        # E.g., [0, 1, 0, 1, 2, 3, 4, 0, 1, 2]
+        # -> [0, 0, K, K, K + 1, K + 1, K + 2, 2 * K, 2 * K, 2 * K + 1]
+        # where K is the max_num_blocks_per_req and the block size is 2.
+        # NOTE(woosuk): We can't simply use `token_indices // block_size` here
+        # because M (max_model_len) is not necessarily divisible by block_size.
+        block_table_indices = (req_indices * self.max_num_blocks_per_req +
+                               positions_np // self.block_size)
+        # NOTE(woosuk): We use torch.index_select instead of np.take here
+        # because torch.index_select is much faster than np.take for large
+        # tensors.
+        block_table_cpu = self.input_batch.block_table.get_cpu_tensor()
+        block_numbers = block_table_cpu.flatten()[block_table_indices].numpy()
+        block_offsets = positions_np % self.block_size
+        np.add(block_numbers * self.block_size,
+               block_offsets,
+               out=self.slot_mapping_np[:total_num_scheduled_tokens])
 
-        # def get_active_block_tables(block_tables, query_lens, seq_lens, block_size,
-        #                             num_blocks):
-        #     context_lens = seq_lens - query_lens
-        #     blocks_per_seq = (context_lens + block_size - 1) // block_size
-        #     num_seqs = len(seq_lens)
-        #     active_blocks: list[int] = []
-        #     for seq_id in range(num_seqs):
-        #         active_blocks = (
-        #             active_blocks +
-        #             block_tables[seq_id, :blocks_per_seq[seq_id]].tolist())
-        #     return F.pad(
-        #         torch.tensor(active_blocks),
-        #         (0, num_blocks - len(active_blocks)),
-        #         "constant",
-        #         0,
-        #     )
-        
+        # Prepare the attention metadata.
+        self.query_start_loc_np[0] = 0
+        np.cumsum(num_scheduled_tokens,
+                  out=self.query_start_loc_np[1:num_reqs + 1])
 
-        # active_block_table = get_active_block_tables(
-        #     block_table,
-        #     torch.tensor(query_lens),
-        #     torch.tensor(seq_lens),
-        #     block_size,
-        #     num_active_blocks,
-        # )
+        seq_lens = (self.input_batch.num_computed_tokens_cpu[:num_reqs] +
+                    num_scheduled_tokens)
+        max_seq_len = seq_lens.max()
+        self.seq_start_loc_np[0] = 0
+        np.cumsum(seq_lens, out=self.seq_start_loc_np[1:num_reqs + 1])
 
-        # context_kv_len = num_active_blocks * block_size
-        # assert context_kv_len == LARGE_TILE_SZ, f"invalid {context_kv_len=}"
-        # prior_mask, active_mask = (
-        #     BlockDiagonalCausalFromBottomRightMask.from_seqlens(query_lens, seq_lens, block_size=block_size))
+        # Copy the tensors to the GPU.
+        self.input_ids[:total_num_scheduled_tokens].copy_(
+            self.input_ids_cpu[:total_num_scheduled_tokens], non_blocking=True)
+        self.positions[:total_num_scheduled_tokens].copy_(
+            self.positions_cpu[:total_num_scheduled_tokens], non_blocking=True)
+        query_start_loc = self.query_start_loc_cpu[:num_reqs + 1].to(
+            self.device, non_blocking=True)
+        seq_start_loc = self.seq_start_loc_cpu[:num_reqs + 1].to(
+            self.device, non_blocking=True)
+        slot_mapping = self.slot_mapping_cpu[:total_num_scheduled_tokens].to(
+            self.device, non_blocking=True).long()
 
-        # attn_mask = torch.concat(
-        #     [
-        #         F.pad(
-        #             prior_mask,
-        #             (
-        #                 0,
-        #                 context_kv_len - prior_mask.shape[1],
-        #                 0,
-        #                 B_P_SIZE - prior_mask.shape[0],
-        #             ),
-        #             "constant",
-        #             0,
-        #         ).bool(),
-        #         F.pad(
-        #             active_mask,
-        #             (
-        #                 0,
-        #                 B_P_SIZE - active_mask.shape[1],
-        #                 0,
-        #                 B_P_SIZE - active_mask.shape[0],
-        #             ),
-        #             "constant",
-        #             0,
-        #         ).bool(),
-        #     ],
-        #     dim=1,
-        # )
+        # Prepare for cascade attention if needed.
+        common_prefix_len = (scheduler_output.num_common_prefix_blocks *
+                             self.block_size)
+        use_cascade = False
+        cu_prefix_query_lens = None
+        cu_prefix_kv_lens = None
+        cu_suffix_kv_lens = None
 
-        # active_block_table = active_block_table.to(torch.int32).to(device=self.device)
-        # attn_mask = attn_mask.to(device=self.device)
-        test_num_decodes = num_decodes
-
-        return (
-            self._prepare_prefill_inputs(num_scheduled_tokens),
-            self._prepare_decode_inputs(num_decodes),
+        attn_metadata = FlashAttentionMetadata(
+            num_actual_tokens=total_num_scheduled_tokens,
+            max_query_len=max_num_scheduled_tokens,
+            query_start_loc=query_start_loc,
+            max_seq_len=max_seq_len,
+            seq_start_loc=seq_start_loc,
+            block_table=(
+                self.input_batch.block_table.get_device_tensor()[:num_reqs]),
+            slot_mapping=slot_mapping,
+            use_cascade=use_cascade,
+            common_prefix_len=common_prefix_len,
+            cu_prefix_query_lens=cu_prefix_query_lens,
+            cu_prefix_kv_lens=cu_prefix_kv_lens,
+            cu_suffix_kv_lens=cu_suffix_kv_lens,
         )
+        # NOTE(woosuk): Due to chunked prefills, there can be at most 1 partial
+        # request in the batch. While we should not sample any token from this
+        # partial request, we do so for simplicity. We will ignore the sampled
+        # token from the partial request.
+        # TODO: Support prompt logprobs.
+        logits_indices = query_start_loc[1:] - 1
+        return attn_metadata, logits_indices
 
     def _prepare_sampling(
         self,
@@ -863,276 +585,278 @@ class NeuronModelRunner:
             ))
 
 
-@dataclass
-class CachedRequestState:
+# @dataclass
+# class CachedRequestState:
 
-    req_id: str
-    prompt_token_ids: List[int]
-    prompt: Optional[str]
-    multi_modal_data: Optional["MultiModalDataDict"]
-    sampling_params: SamplingParams
-    generator: Optional[torch.Generator]
+#     req_id: str
+#     prompt_token_ids: List[int]
+#     prompt: Optional[str]
+#     multi_modal_data: Optional["MultiModalDataDict"]
+#     sampling_params: SamplingParams
+#     generator: Optional[torch.Generator]
 
-    block_ids: List[int]
-    num_computed_tokens: int
-    output_token_ids: List[int]
+#     block_ids: List[int]
+#     num_computed_tokens: int
+#     output_token_ids: List[int]
 
-    @property
-    def num_tokens(self) -> int:
-        return len(self.prompt_token_ids) + len(self.output_token_ids)
+#     @property
+#     def num_tokens(self) -> int:
+#         return len(self.prompt_token_ids) + len(self.output_token_ids)
 
-
-class InputBatch:
-
-    def __init__(
-        self,
-        max_num_reqs: int,
-        max_model_len: int,
-        max_num_blocks_per_req: int,
-        device: torch.device,
-        pin_memory: bool,
-    ):
-        self.max_num_reqs = max_num_reqs
-        self.max_model_len = max_model_len
-        self.max_num_blocks_per_req = max_num_blocks_per_req
-        self.device = device
-        self.pin_memory = pin_memory
-
-        self.req_ids: List[Optional[str]] = [None] * max_num_reqs
-        self.req_id_to_index: Dict[str, int] = {}
-
-        self.token_ids_cpu = np.zeros((max_num_reqs, max_model_len),
-                                      dtype=np.int32)
-        self.num_computed_tokens_cpu = np.zeros(max_num_reqs, dtype=np.int32)
-
-        # Attention-related.
-        self.block_table = torch.zeros((max_num_reqs, max_num_blocks_per_req),
-                                       device=self.device,
-                                       dtype=torch.int32)
-        self.block_table_cpu_tensor = torch.zeros(
-            (max_num_reqs, max_num_blocks_per_req),
-            device="cpu",
-            dtype=torch.int32,
-            pin_memory=pin_memory,
-        )
-        self.block_table_cpu = self.block_table_cpu_tensor.numpy()
-
-        # Sampling-related.
-        self.temperature = torch.empty((max_num_reqs, ),
-                                       dtype=torch.float32,
-                                       device=device)
-        self.temperature_cpu_tensor = torch.empty((max_num_reqs, ),
-                                                  dtype=torch.float32,
-                                                  device="cpu",
-                                                  pin_memory=pin_memory)
-        self.temperature_cpu = self.temperature_cpu_tensor.numpy()
-        self.greedy_reqs: Set[str] = set()
-        self.random_reqs: Set[str] = set()
-
-        self.top_p = torch.empty((max_num_reqs, ),
-                                 dtype=torch.float32,
-                                 device=device)
-        self.top_p_cpu_tensor = torch.empty((max_num_reqs, ),
-                                            dtype=torch.float32,
-                                            device="cpu",
-                                            pin_memory=pin_memory)
-        self.top_p_cpu = self.top_p_cpu_tensor.numpy()
-        self.top_p_reqs: Set[str] = set()
-
-        self.top_k = torch.empty((max_num_reqs, ),
-                                 dtype=torch.int32,
-                                 device=device)
-        self.top_k_cpu_tensor = torch.empty((max_num_reqs, ),
-                                            dtype=torch.int32,
-                                            device="cpu",
-                                            pin_memory=pin_memory)
-        self.top_k_cpu = self.top_k_cpu_tensor.numpy()
-        self.top_k_reqs: Set[str] = set()
-
-        # req_index -> generator
-        self.generators: Dict[int, torch.Generator] = {}
-
-        self.num_logprobs: Dict[str, int] = {}
-        self.prompt_logprob_reqs: Set[str] = set()
-
-        self.num_prefills = 0
-
-    def add_request(
-        self,
-        request: "CachedRequestState",
-        req_index: Optional[int] = None,
-    ) -> None:
-        if req_index is None:
-            req_index = self.num_reqs
-        assert req_index < self.max_num_reqs
-
-        req_id = request.req_id
-        self.req_ids[req_index] = req_id
-        self.req_id_to_index[req_id] = req_index
-
-        # Copy the prompt token ids and output token ids.
-        num_prompt_tokens = len(request.prompt_token_ids)
-        self.token_ids_cpu[
-            req_index, :num_prompt_tokens] = request.prompt_token_ids
-        start_idx = num_prompt_tokens
-        end_idx = start_idx + len(request.output_token_ids)
-        self.token_ids_cpu[req_index,
-                           start_idx:end_idx] = request.output_token_ids
-
-        self.num_computed_tokens_cpu[req_index] = request.num_computed_tokens
-        num_blocks = len(request.block_ids)
-        self.block_table_cpu[req_index, :num_blocks] = request.block_ids
-
-        sampling_params = request.sampling_params
-        self.temperature_cpu[req_index] = sampling_params.temperature
-        if sampling_params.sampling_type == SamplingType.GREEDY:
-            self.greedy_reqs.add(req_id)
-        else:
-            self.random_reqs.add(req_id)
-
-        self.top_p_cpu[req_index] = sampling_params.top_p
-        if sampling_params.top_p < 1:
-            self.top_p_reqs.add(req_id)
-        self.top_k_cpu[req_index] = sampling_params.top_k
-        if sampling_params.top_k > 0:
-            self.top_k_reqs.add(req_id)
-
-        self.generators[req_index] = request.generator
-
-        num_logprobs = sampling_params.logprobs
-        if num_logprobs is not None and num_logprobs > 0:
-            self.num_logprobs[req_id] = num_logprobs
-        if sampling_params.prompt_logprobs:
-            self.prompt_logprob_reqs.add(req_id)
-
-    def remove_request(self, req_id: str) -> Optional[int]:
-        req_index = self.req_id_to_index.pop(req_id, None)
-        if req_index is None:
-            return None
-        self.req_ids[req_index] = None
-
-        self.greedy_reqs.discard(req_id)
-        self.random_reqs.discard(req_id)
-        self.top_p_reqs.discard(req_id)
-        self.top_k_reqs.discard(req_id)
-        self.generators.pop(req_index, None)
-        self.num_logprobs.pop(req_id, None)
-        self.prompt_logprob_reqs.discard(req_id)
-        return req_index
-
-    def clear(self) -> None:
-        self.req_ids = [None] * self.max_num_reqs
-        self.req_id_to_index.clear()
-        self.greedy_reqs.clear()
-        self.random_reqs.clear()
-        self.top_p_reqs.clear()
-        self.top_k_reqs.clear()
-        self.generators.clear()
-        self.num_logprobs.clear()
-        self.prompt_logprob_reqs.clear()
-
-    def condense(self, empty_req_indices: List[int]) -> None:
-        if self.num_reqs == 0:
-            # The batched states are empty.
-            return
-
-        # NOTE(woosuk): This function assumes that the empty_req_indices
-        # is sorted in descending order.
-        last_req_index = self.num_reqs + len(empty_req_indices) - 1
-        while empty_req_indices:
-            # Find the largest non-empty index.
-            while last_req_index in empty_req_indices:
+def xxInputBatch():
+    """
+    class InputBatch:
+    
+        def __init__(
+            self,
+            max_num_reqs: int,
+            max_model_len: int,
+            max_num_blocks_per_req: int,
+            device: torch.device,
+            pin_memory: bool,
+        ):
+            self.max_num_reqs = max_num_reqs
+            self.max_model_len = max_model_len
+            self.max_num_blocks_per_req = max_num_blocks_per_req
+            self.device = device
+            self.pin_memory = pin_memory
+    
+            self.req_ids: List[Optional[str]] = [None] * max_num_reqs
+            self.req_id_to_index: Dict[str, int] = {}
+    
+            self.token_ids_cpu = np.zeros((max_num_reqs, max_model_len),
+                                          dtype=np.int32)
+            self.num_computed_tokens_cpu = np.zeros(max_num_reqs, dtype=np.int32)
+    
+            # Attention-related.
+            self.block_table = torch.zeros((max_num_reqs, max_num_blocks_per_req),
+                                           device=self.device,
+                                           dtype=torch.int32)
+            self.block_table_cpu_tensor = torch.zeros(
+                (max_num_reqs, max_num_blocks_per_req),
+                device="cpu",
+                dtype=torch.int32,
+                pin_memory=pin_memory,
+            )
+            self.block_table_cpu = self.block_table_cpu_tensor.numpy()
+    
+            # Sampling-related.
+            self.temperature = torch.empty((max_num_reqs, ),
+                                           dtype=torch.float32,
+                                           device=device)
+            self.temperature_cpu_tensor = torch.empty((max_num_reqs, ),
+                                                      dtype=torch.float32,
+                                                      device="cpu",
+                                                      pin_memory=pin_memory)
+            self.temperature_cpu = self.temperature_cpu_tensor.numpy()
+            self.greedy_reqs: Set[str] = set()
+            self.random_reqs: Set[str] = set()
+    
+            self.top_p = torch.empty((max_num_reqs, ),
+                                     dtype=torch.float32,
+                                     device=device)
+            self.top_p_cpu_tensor = torch.empty((max_num_reqs, ),
+                                                dtype=torch.float32,
+                                                device="cpu",
+                                                pin_memory=pin_memory)
+            self.top_p_cpu = self.top_p_cpu_tensor.numpy()
+            self.top_p_reqs: Set[str] = set()
+    
+            self.top_k = torch.empty((max_num_reqs, ),
+                                     dtype=torch.int32,
+                                     device=device)
+            self.top_k_cpu_tensor = torch.empty((max_num_reqs, ),
+                                                dtype=torch.int32,
+                                                device="cpu",
+                                                pin_memory=pin_memory)
+            self.top_k_cpu = self.top_k_cpu_tensor.numpy()
+            self.top_k_reqs: Set[str] = set()
+    
+            # req_index -> generator
+            self.generators: Dict[int, torch.Generator] = {}
+    
+            self.num_logprobs: Dict[str, int] = {}
+            self.prompt_logprob_reqs: Set[str] = set()
+    
+            self.num_prefills = 0
+    
+        def add_request(
+            self,
+            request: "CachedRequestState",
+            req_index: Optional[int] = None,
+        ) -> None:
+            if req_index is None:
+                req_index = self.num_reqs
+            assert req_index < self.max_num_reqs
+    
+            req_id = request.req_id
+            self.req_ids[req_index] = req_id
+            self.req_id_to_index[req_id] = req_index
+    
+            # Copy the prompt token ids and output token ids.
+            num_prompt_tokens = len(request.prompt_token_ids)
+            self.token_ids_cpu[
+                req_index, :num_prompt_tokens] = request.prompt_token_ids
+            start_idx = num_prompt_tokens
+            end_idx = start_idx + len(request.output_token_ids)
+            self.token_ids_cpu[req_index,
+                               start_idx:end_idx] = request.output_token_ids
+    
+            self.num_computed_tokens_cpu[req_index] = request.num_computed_tokens
+            num_blocks = len(request.block_ids)
+            self.block_table_cpu[req_index, :num_blocks] = request.block_ids
+    
+            sampling_params = request.sampling_params
+            self.temperature_cpu[req_index] = sampling_params.temperature
+            if sampling_params.sampling_type == SamplingType.GREEDY:
+                self.greedy_reqs.add(req_id)
+            else:
+                self.random_reqs.add(req_id)
+    
+            self.top_p_cpu[req_index] = sampling_params.top_p
+            if sampling_params.top_p < 1:
+                self.top_p_reqs.add(req_id)
+            self.top_k_cpu[req_index] = sampling_params.top_k
+            if sampling_params.top_k > 0:
+                self.top_k_reqs.add(req_id)
+    
+            self.generators[req_index] = request.generator
+    
+            num_logprobs = sampling_params.logprobs
+            if num_logprobs is not None and num_logprobs > 0:
+                self.num_logprobs[req_id] = num_logprobs
+            if sampling_params.prompt_logprobs:
+                self.prompt_logprob_reqs.add(req_id)
+    
+        def remove_request(self, req_id: str) -> Optional[int]:
+            req_index = self.req_id_to_index.pop(req_id, None)
+            if req_index is None:
+                return None
+            self.req_ids[req_index] = None
+    
+            self.greedy_reqs.discard(req_id)
+            self.random_reqs.discard(req_id)
+            self.top_p_reqs.discard(req_id)
+            self.top_k_reqs.discard(req_id)
+            self.generators.pop(req_index, None)
+            self.num_logprobs.pop(req_id, None)
+            self.prompt_logprob_reqs.discard(req_id)
+            return req_index
+    
+        def clear(self) -> None:
+            self.req_ids = [None] * self.max_num_reqs
+            self.req_id_to_index.clear()
+            self.greedy_reqs.clear()
+            self.random_reqs.clear()
+            self.top_p_reqs.clear()
+            self.top_k_reqs.clear()
+            self.generators.clear()
+            self.num_logprobs.clear()
+            self.prompt_logprob_reqs.clear()
+    
+        def condense(self, empty_req_indices: List[int]) -> None:
+            if self.num_reqs == 0:
+                # The batched states are empty.
+                return
+    
+            # NOTE(woosuk): This function assumes that the empty_req_indices
+            # is sorted in descending order.
+            last_req_index = self.num_reqs + len(empty_req_indices) - 1
+            while empty_req_indices:
+                # Find the largest non-empty index.
+                while last_req_index in empty_req_indices:
+                    last_req_index -= 1
+    
+                # Find the smallest empty index.
+                empty_index = empty_req_indices.pop()
+                if empty_index >= last_req_index:
+                    break
+    
+                # Swap the states.
+                req_id = self.req_ids[last_req_index]
+                self.req_ids[empty_index] = req_id
+                self.req_ids[last_req_index] = None
+                self.req_id_to_index[req_id] = empty_index
+    
+                # TODO(woosuk): Optimize the copy of token_ids_cpu and
+                # block_table_cpu.
+                self.token_ids_cpu[empty_index] = self.token_ids_cpu[
+                    last_req_index]
+                self.num_computed_tokens_cpu[
+                    empty_index] = self.num_computed_tokens_cpu[last_req_index]
+                self.block_table_cpu[empty_index] = self.block_table_cpu[
+                    last_req_index]
+                self.temperature_cpu[empty_index] = self.temperature_cpu[
+                    last_req_index]
+                self.top_p_cpu[empty_index] = self.top_p_cpu[last_req_index]
+                self.top_k_cpu[empty_index] = self.top_k_cpu[last_req_index]
+                generator = self.generators.pop(last_req_index, None)
+                if generator is not None:
+                    self.generators[empty_index] = generator
+    
+                # Decrement last_req_index since it is now empty.
                 last_req_index -= 1
-
-            # Find the smallest empty index.
-            empty_index = empty_req_indices.pop()
-            if empty_index >= last_req_index:
-                break
-
-            # Swap the states.
-            req_id = self.req_ids[last_req_index]
-            self.req_ids[empty_index] = req_id
-            self.req_ids[last_req_index] = None
-            self.req_id_to_index[req_id] = empty_index
-
-            # TODO(woosuk): Optimize the copy of token_ids_cpu and
-            # block_table_cpu.
-            self.token_ids_cpu[empty_index] = self.token_ids_cpu[
-                last_req_index]
-            self.num_computed_tokens_cpu[
-                empty_index] = self.num_computed_tokens_cpu[last_req_index]
-            self.block_table_cpu[empty_index] = self.block_table_cpu[
-                last_req_index]
-            self.temperature_cpu[empty_index] = self.temperature_cpu[
-                last_req_index]
-            self.top_p_cpu[empty_index] = self.top_p_cpu[last_req_index]
-            self.top_k_cpu[empty_index] = self.top_k_cpu[last_req_index]
-            generator = self.generators.pop(last_req_index, None)
-            if generator is not None:
-                self.generators[empty_index] = generator
-
-            # Decrement last_req_index since it is now empty.
-            last_req_index -= 1
-
-    def make_sampling_metadata(
-        self,
-        skip_copy: bool = False,
-    ) -> SamplingMetadata:
-        if not skip_copy:
-            self.temperature[:self.num_reqs].copy_(
-                self.temperature_cpu_tensor[:self.num_reqs], non_blocking=True)
-            self.top_p[:self.num_reqs].copy_(
-                self.top_p_cpu_tensor[:self.num_reqs], non_blocking=True)
-            self.top_k[:self.num_reqs].copy_(
-                self.top_k_cpu_tensor[:self.num_reqs], non_blocking=True)
-        return SamplingMetadata(
-            temperature=self.temperature[:self.num_reqs],
-            all_greedy=self.all_greedy,
-            all_random=self.all_random,
-            top_p=self.top_p[:self.num_reqs],
-            top_k=self.top_k[:self.num_reqs],
-            no_top_p=self.no_top_p,
-            no_top_k=self.no_top_k,
-            generators=self.generators,
-            max_num_logprobs=self.max_num_logprobs,
-        )
-
-    @property
-    def num_reqs(self) -> int:
-        return len(self.req_id_to_index)
-
-    @property
-    def num_decodes(self) -> int:
-        return self.num_reqs - self.num_prefills
-
-    @property
-    def all_greedy(self) -> bool:
-        return len(self.random_reqs) == 0
-
-    @property
-    def all_random(self) -> bool:
-        return len(self.greedy_reqs) == 0
-
-    @property
-    def no_top_p(self) -> bool:
-        return len(self.top_p_reqs) == 0
-
-    @property
-    def no_top_k(self) -> bool:
-        return len(self.top_k_reqs) == 0
-
-    @property
-    def max_num_logprobs(self) -> int:
-        return max(self.num_logprobs.values()) if self.num_logprobs else 0
-
-    @property
-    def no_logprob(self) -> bool:
-        return len(self.num_logprobs) == 0
-
-    @property
-    def no_prompt_logprob(self) -> bool:
-        return len(self.prompt_logprob_reqs) == 0
-
+    
+        def make_sampling_metadata(
+            self,
+            skip_copy: bool = False,
+        ) -> SamplingMetadata:
+            if not skip_copy:
+                self.temperature[:self.num_reqs].copy_(
+                    self.temperature_cpu_tensor[:self.num_reqs], non_blocking=True)
+                self.top_p[:self.num_reqs].copy_(
+                    self.top_p_cpu_tensor[:self.num_reqs], non_blocking=True)
+                self.top_k[:self.num_reqs].copy_(
+                    self.top_k_cpu_tensor[:self.num_reqs], non_blocking=True)
+            return SamplingMetadata(
+                temperature=self.temperature[:self.num_reqs],
+                all_greedy=self.all_greedy,
+                all_random=self.all_random,
+                top_p=self.top_p[:self.num_reqs],
+                top_k=self.top_k[:self.num_reqs],
+                no_top_p=self.no_top_p,
+                no_top_k=self.no_top_k,
+                generators=self.generators,
+                max_num_logprobs=self.max_num_logprobs,
+            )
+    
+        @property
+        def num_reqs(self) -> int:
+            return len(self.req_id_to_index)
+    
+        @property
+        def num_decodes(self) -> int:
+            return self.num_reqs - self.num_prefills
+    
+        @property
+        def all_greedy(self) -> bool:
+            return len(self.random_reqs) == 0
+    
+        @property
+        def all_random(self) -> bool:
+            return len(self.greedy_reqs) == 0
+    
+        @property
+        def no_top_p(self) -> bool:
+            return len(self.top_p_reqs) == 0
+    
+        @property
+        def no_top_k(self) -> bool:
+            return len(self.top_k_reqs) == 0
+    
+        @property
+        def max_num_logprobs(self) -> int:
+            return max(self.num_logprobs.values()) if self.num_logprobs else 0
+    
+        @property
+        def no_logprob(self) -> bool:
+            return len(self.num_logprobs) == 0
+    
+        @property
+        def no_prompt_logprob(self) -> bool:
+            return len(self.prompt_logprob_reqs) == 0
+    """
+    pass
 
 class ModelWrapper(TorchCompileWrapperWithCustomDispatcher):
 

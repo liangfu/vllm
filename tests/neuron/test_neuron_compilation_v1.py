@@ -5,6 +5,9 @@ os.environ["NEURON_CC_FLAGS"]= " --model-type=transformer -O1 --internal-hlo2ten
 # Use V1
 os.environ["VLLM_USE_V1"]="1"
 os.environ["VLLM_ENABLE_V1_MULTIPROCESSING"]="0"
+# disable out-of-bound check
+os.environ["NEURON_RT_DBG_EMBEDDING_UPDATE_BOUND_CHECK"] = "0"
+os.environ["NEURON_RT_DBG_INDIRECT_MEMCPY_BOUND_CHECK"] = "0"
 import tempfile
 
 import depyf
@@ -13,7 +16,8 @@ from vllm.config import CompilationLevel
 
 temp_dir = tempfile.mkdtemp()
 print(f"temp dir for compile debug: {temp_dir}")
-with depyf.prepare_debug(temp_dir):
+# with depyf.prepare_debug(temp_dir):
+if True:
     from vllm import LLM, SamplingParams
 
     prompts = [

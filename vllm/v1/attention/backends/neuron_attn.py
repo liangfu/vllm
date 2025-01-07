@@ -128,7 +128,7 @@ class BlockDiagonalCausalFromBottomRightMask:
 @dataclass
 class NeuronAttentionMetadata:
 
-    is_prompt: bool
+    # is_prompt: bool
     slot_mapping: torch.Tensor
     block_tables: Optional[torch.Tensor] = None
     context_lens: Optional[torch.Tensor] = None
@@ -287,200 +287,26 @@ class NeuronAttentionBackendImpl(AttentionImpl):
             v = value[batch_idx,:,:,:].unsqueeze(0)
             # debug tricks
             attn_mask = attn_metadata.attn_mask.permute(0,1)
-            if attn_metadata.is_prompt is True:
-                out = context_flash_attention_fwd(
-                    q.permute(0,2,3,1).contiguous(),
-                    k.permute(0,2,3,1).contiguous(),
-                    v.permute(0,2,1,3).contiguous(),
-                    attn_mask=attn_metadata.attn_mask,
-                    head_size=self.head_size,
-                )
-                # out = q.permute(0,2,3,1)
-            else:
-                q = q.permute(0,2,3,1).contiguous()
-                k = k.permute(0,2,3,1).contiguous()
-                v = v.permute(0,2,1,3).contiguous()
-                out = context_attention_fwd(
-                    q,
-                    k,
-                    v,
-                    key_cache,
-                    value_cache,
-                    block_table=attn_metadata.active_block_table,
-                    attn_mask=attn_mask,
-                    n_kv_head=self.num_kv_heads,
-                    head_size=self.head_size,
-                )
+            q = q.permute(0,2,3,1).contiguous()
+            k = k.permute(0,2,3,1).contiguous()
+            v = v.permute(0,2,1,3).contiguous()
+            out = context_attention_fwd(
+                q,
+                k,
+                v,
+                key_cache,
+                value_cache,
+                block_table=attn_metadata.active_block_table,
+                attn_mask=attn_mask,
+                n_kv_head=self.num_kv_heads,
+                head_size=self.head_size,
+            )
             out = out[:,:,:seq_len,:self.head_size]
             out = out.permute(0, 2, 1, 3).contiguous()
             output.append(out)
             # output[batch_idx,:,:,:].unsqueeze(0) = out
         # Reshape the output tensor.
         output = torch.cat(output, dim=0)
-        return output.reshape(batch_size, seq_len, hidden_size)
-        # if attn_metadata.num_prefills > 0:
-        if attn_metadata.is_prompt is True:
-            # if attn_metadata.block_tables is None:
-            #     # Prefill without paged KV cache.
-            assert seq_len % 16 == 0, (
-                "Pallas FlashAttention kernel requires seq_len to be a "
-                f"multiple of 16 but got {seq_len}")
-
-            # # Handle GQA/MQA.
-            # # NKI attention dosen't need this
-            # if self.num_kv_heads != self.num_heads:
-            #     key = key.repeat_interleave(self.num_queries_per_kv,
-            #                                 dim=-2)
-            #     key = key.view(batch_size, seq_len, self.num_heads,
-            #                    self.head_size)
-            #     value = value.repeat_interleave(self.num_queries_per_kv,
-            #                                     dim=-2)
-            #     value = value.view(batch_size, seq_len, self.num_heads,
-            #                        self.head_size)
-            # FlashAttention kernel requires the input shape to be
-            # [batch_size, num_heads, seq_len, d_model]
-            # while the input is [batch_size, seq_len, num_heads, d_model].
-            # Permute the input to match the required format.
-            # NKI Flash paged  attention reuiqres the input shape to be
-            # query: [1, n_heads, d, seq_q]
-            # key: [1, n_kv_heads, d, seq_k]
-            # value: [1, n_kv_heads, seq_v, d]
-            # key_cache: (num_blocks, block_size, n_kv_heads, d)
-            # value_cache: (num_blocks, block_size, n_kv_heads, d)
-            # block_tables: (num_active_blocks, )
-            # mask: (seq_q, num_active_blocks * block_size)
-            # o: shape (1, n_heads, seq_q, d)
-            # l_m: shape (1, n_heads, seq_q, 2)
-            # padding
-            pad_dims = (
-                0,
-                B_P_SIZE - query.shape[3],
-                0,
-                0,
-                0,
-                B_P_SIZE - query.shape[1],
-                0,
-                0
-            )
-            query = F.pad(query, pad_dims, "constant", 0)
-            key = F.pad(key, pad_dims, "constant", 0)
-            value = F.pad(value, pad_dims, "constant", 0)
-            key_cache = F.pad(key_cache, (0, B_P_SIZE - self.head_size), "constant", 0)
-            value_cache = F.pad(value_cache, (0, B_P_SIZE - self.head_size), "constant", 0)
-            from vllm.attention.ops.nki_flash_attn import context_attention_fwd
-            output = context_attention_fwd(
-                query.permute(0,2,3,1),
-                key.permute(0,2,3,1),
-                value.permute(0,2,1,3),
-                key_cache=key_cache.permute(0,1,2,3),
-                value_cache=value_cache.permute(0,1,2,3),
-                block_table=attn_metadata.active_block_table,
-                attn_mask=attn_metadata.attn_mask,
-                # n_kv_head=self.num_kv_heads,
-                # head_size=self.head_size,
-                # query_lens=torch.tensor([seq_len]),
-                # seq_lens=torch.tensor([seq_len]),
-                # batch_size=batch_size,
-                # block_size=block_size,
-                # max_model_len=seq_len,
-            )
-            # output = torch.ops.xla.flash_attention(
-            #     query.permute(0, 2, 1, 3),
-            #     key.permute(0, 2, 1, 3),
-            #     value.permute(0, 2, 1, 3),
-            #     True,
-            # )
-            output = output[:,:,:seq_len,:self.head_size]
-            output = output.permute(0, 2, 1, 3)
-            # else:
-            #     # Prefill with paged KV cache.
-            #     # TODO(woosuk): Tune the below knobs.
-            #     num_kv_pages_per_compute_block = 16
-            #     num_queries_per_compute_block = 16
-            #     assert seq_len % num_queries_per_compute_block == 0
-            #     # output = torch.ops.xla.multi_queries_paged_attention(
-            #     #     query,
-            #     #     key_cache,
-            #     #     value_cache,
-            #     #     attn_metadata.context_lens,
-            #     #     attn_metadata.block_tables,
-            #     #     attn_metadata.effective_query_lens,
-            #     #     num_kv_pages_per_compute_block,
-            #     #     num_queries_per_compute_block,
-            #     #     use_kernel=True,
-            #     # )
-            #     from vllm.attention.ops.nki_flash_attn import context_attention_fwd
-            #     output = context_attention_fwd(
-            #         query.permute(0,2,3,1),
-            #         key.permute(0,2,3,1),
-            #         value.permute(0,2,1,3),
-            #         # query,
-            #         # key,
-            #         # value,
-            #         key_cache=key_cache,
-            #         value_cache=value_cache,
-            #         block_table=None,
-            #         attn_mask=None,
-            #         n_kv_head=self.num_kv_heads,
-            #         head_size=self.head_size,
-            #         # query_lens=attn_metadata.effective_query_lens,
-            #         # seq_lens=attn_metadata.context_lens+attn_metadata.effective_query_lens,
-            #         # batch_size=batch_size,
-            #         # block_size=block_size,
-            #     )
-        else:
-            # Decoding run.
-            assert kv_cache[0].numel() > 0
-            query = query.squeeze(dim=1)
-            pages_per_compute_block = 16  # TODO(woosuk): Tune this value.
-
-            assert attn_metadata.block_tables is not None
-            assert attn_metadata.context_lens is not None
-            # NOTE(woosuk): The PagedAttention Pallas kernel stores the entire
-            # block table in SMEM. Therefore, if the block table is too large,
-            # the kernel compilation will fail. To avoid this, we split the
-            # batch dimension into smaller chunks and run the kernel multiple
-            # times.
-            MAX_SMEM_USAGE = 512 * 1024
-            size_per_seq = 4 * attn_metadata.block_tables.shape[1]
-            max_num_seq = MAX_SMEM_USAGE // size_per_seq
-
-            if batch_size <= max_num_seq:
-                output = paged_attention(
-                    query,
-                    key_cache,
-                    value_cache,
-                    attn_metadata.context_lens,
-                    attn_metadata.block_tables,
-                    pages_per_compute_block,
-                    self.megacore_mode,
-                )
-            else:
-                chunk_size = max_num_seq
-                # Make sure the chunk size is a multiple of 2.
-                chunk_size = chunk_size // 2 * 2
-                num_chunks = (batch_size + chunk_size - 1) // chunk_size
-
-                output = torch.empty_like(query)
-                for chunk_idx in range(num_chunks):
-                    chunk_start = chunk_idx * chunk_size
-                    chunk_end = chunk_start + chunk_size
-                    # NOTE(woosuk): We skip this line because it causes Dynamo
-                    # compilation error. Instead, we rely on the slice operation
-                    # to handle the out-of-bound case.
-                    # chunk_end = min(chunk_end, batch_size)
-                    chunk_output = paged_attention(
-                        query[chunk_start:chunk_end],
-                        key_cache,
-                        value_cache,
-                        attn_metadata.context_lens[chunk_start:chunk_end],
-                        attn_metadata.block_tables[chunk_start:chunk_end],
-                        pages_per_compute_block,
-                        self.megacore_mode,
-                    )
-                    output[chunk_start:chunk_end] = chunk_output
-
-        # Reshape the output tensor.
         return output.reshape(batch_size, seq_len, hidden_size)
 
 
