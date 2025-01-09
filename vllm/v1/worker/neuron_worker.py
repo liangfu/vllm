@@ -69,7 +69,7 @@ class NeuronWorker:
         self.device_config.device = self.device
 
         # Init ModelRunner here, so that we have access to self.device.
-        self.model_runner = NeuronModelRunner(self.vllm_config)
+        self.model_runner = NeuronModelRunner(self.vllm_config, device=self.device)
 
         # HACK AOYU bypass the following initilize steps for neuron
         # # Set random seed.

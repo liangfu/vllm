@@ -58,8 +58,11 @@ class BlockTable:
         self.num_blocks_per_row[tgt] = num_blocks
 
     def commit(self, num_reqs: int) -> None:
-        self.block_table[:num_reqs].copy_(self.block_table_cpu[:num_reqs],
-                                          non_blocking=True)
+        _, length = self.block_table_cpu.shape
+        table = self.block_table_cpu[:num_reqs].to(device=self.device)
+        index = torch.arange(num_reqs, device=self.device)
+        self.block_table.index_copy_(0, index, table)
+        print(f"{self.block_table}")
 
     def clear(self) -> None:
         self.block_table.fill_(0)

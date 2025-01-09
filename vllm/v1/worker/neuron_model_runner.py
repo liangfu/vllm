@@ -21,6 +21,7 @@ from vllm.v1.attention.backends.neuron_attn import (NeuronAttentionBackend,
                                                NeuronAttentionMetadata, BlockDiagonalCausalFromBottomRightMask)
 from vllm.v1.outputs import ModelRunnerOutput
 from vllm.v1.sample.metadata import SamplingMetadata
+from vllm.v1.worker.model_runner_base import ModelRunnerBase
 from vllm.v1.worker.gpu_input_batch import CachedRequestState, InputBatch
 
 import torch_xla.runtime as xr
@@ -40,71 +41,74 @@ B_P_SIZE = 128
 LARGE_TILE_SZ = 2048
 
 
-class NeuronModelRunner:
+class NeuronModelRunner(ModelRunnerBase):
 
     def __init__(
         self,
         vllm_config: VllmConfig,
+        device: torch.device,
     ):
-        # TODO: use ModelRunnerBase.__init__(self, vllm_config=vllm_config)
-        self.vllm_config = vllm_config
-        self.model_config = vllm_config.model_config
-        self.cache_config = vllm_config.cache_config
-        self.lora_config = vllm_config.lora_config
-        self.load_config = vllm_config.load_config
-        self.parallel_config = vllm_config.parallel_config
-        self.scheduler_config = vllm_config.scheduler_config
-        self.device_config = vllm_config.device_config
-        self.speculative_config = vllm_config.speculative_config
-        self.prompt_adapter_config = vllm_config.prompt_adapter_config
-        self.observability_config = vllm_config.observability_config
+        # TODO: use 
+        ModelRunnerBase.__init__(self, vllm_config=vllm_config, device=device)
+        # self.vllm_config = vllm_config
+        # self.model_config = vllm_config.model_config
+        # self.cache_config = vllm_config.cache_config
+        # self.lora_config = vllm_config.lora_config
+        # self.load_config = vllm_config.load_config
+        # self.parallel_config = vllm_config.parallel_config
+        # self.scheduler_config = vllm_config.scheduler_config
+        # self.device_config = vllm_config.device_config
+        # self.speculative_config = vllm_config.speculative_config
+        # self.prompt_adapter_config = vllm_config.prompt_adapter_config
+        # self.observability_config = vllm_config.observability_config
 
-        model_config = self.model_config
-        cache_config = self.cache_config
-        scheduler_config = self.scheduler_config
-        parallel_config = self.parallel_config
-        self.device = self.device_config.device
-        self.pin_memory = is_pin_memory_available()
-        self.dtype = self.model_config.dtype
-        if cache_config.cache_dtype == "auto":
-            self.kv_cache_dtype = self.dtype
-        else:
-            self.kv_cache_dtype = STR_DTYPE_TO_TORCH_DTYPE[
-                cache_config.cache_dtype]
+        # model_config = self.model_config
+        # cache_config = self.cache_config
+        # scheduler_config = self.scheduler_config
+        # parallel_config = self.parallel_config
+        # self.device = self.device_config.device
+        # self.pin_memory = is_pin_memory_available()
+        # self.dtype = self.model_config.dtype
+        # if cache_config.cache_dtype == "auto":
+        #     self.kv_cache_dtype = self.dtype
+        # else:
+        #     self.kv_cache_dtype = STR_DTYPE_TO_TORCH_DTYPE[
+        #         cache_config.cache_dtype]
 
-        self.sliding_window = model_config.get_sliding_window()
-        self.block_size = cache_config.block_size
-        self.max_model_len = model_config.max_model_len
-        self.max_num_blocks_per_req = cdiv(self.max_model_len, self.block_size)
-        self.max_num_tokens = scheduler_config.max_num_batched_tokens
+        # self.sliding_window = model_config.get_sliding_window()
+        # self.block_size = cache_config.block_size
+        # self.max_model_len = model_config.max_model_len
+        # self.max_num_blocks_per_req = cdiv(self.max_model_len, self.block_size)
+        # self.max_num_tokens = scheduler_config.max_num_batched_tokens
 
-        # Model-related.
-        # HACK AOYU use latest implementation
-        # self.num_attn_layers = model_config.get_num_attention_layers(
-        #     parallel_config)
-        self.num_attn_layers = model_config.get_num_layers_by_block_type(
-            parallel_config, LayerBlockType.attention)
-        self.num_kv_heads = model_config.get_num_kv_heads(parallel_config)
-        self.head_size = model_config.get_head_size()
+        # # Model-related.
+        # # HACK AOYU use latest implementation
+        # # self.num_attn_layers = model_config.get_num_attention_layers(
+        # #     parallel_config)
+        # self.num_attn_layers = model_config.get_num_layers_by_block_type(
+        #     parallel_config, LayerBlockType.attention)
+        # self.num_kv_heads = model_config.get_num_kv_heads(parallel_config)
+        # self.head_size = model_config.get_head_size()
 
-        # List[k_cache, v_cache]
-        self.kv_caches: List[Tuple[torch.Tensor, torch.Tensor]] = []
+        # # List[k_cache, v_cache]
+        # self.kv_caches: List[Tuple[torch.Tensor, torch.Tensor]] = []
 
-        # Request states.
-        self.requests: Dict[str, CachedRequestState] = {}
-        # Persistent batch.
-        self.input_batch = InputBatch(
-            max_num_reqs=self.scheduler_config.max_num_seqs,
-            max_model_len=self.max_model_len,
-            max_num_blocks_per_req=self.max_num_blocks_per_req,
-            device=self.device,
-            pin_memory=self.pin_memory,
-        )
+        # # Request states.
+        # self.requests: Dict[str, CachedRequestState] = {}
+        # # Persistent batch.
+        # self.input_batch = InputBatch(
+        #     max_num_reqs=self.scheduler_config.max_num_seqs,
+        #     max_model_len=self.max_model_len,
+        #     max_num_blocks_per_req=self.max_num_blocks_per_req,
+        #     device=self.device,
+        #     pin_memory=self.pin_memory,
+        #     vocab_size=model_config.get_vocab_size(),
+        # )
 
-        self.prefill_positions = torch.tensor(
-            range(self.max_model_len),
-            device="cpu",
-        ).to(torch.int32).reshape(1, -1)
+        # self.prefill_positions = torch.tensor(
+        #     range(self.max_model_len),
+        #     device="cpu",
+        # ).to(torch.int32).reshape(1, -1)
 
     def _update_states(self, scheduler_output: "SchedulerOutput") -> None:
         # Remove stopped requests from the cached states.
@@ -146,9 +150,9 @@ class NeuronModelRunner:
 
         req_ids_to_add: List[str] = []
         # Add new requests to the cached states.
-        for req_data in scheduler_output.scheduled_new_reqs:
-            req_id = req_data.req_id
-            sampling_params = req_data.sampling_params
+        for new_req_data in scheduler_output.scheduled_new_reqs:
+            req_id = new_req_data.req_id
+            sampling_params = new_req_data.sampling_params
             if sampling_params.sampling_type == SamplingType.RANDOM_SEED:
                 generator = torch.Generator(device=self.device)
                 generator.manual_seed(sampling_params.seed)
@@ -156,27 +160,39 @@ class NeuronModelRunner:
                 generator = None
 
             # HACK AOYU reuse cached request state in gpu_input_batch.py, may change in neuron
+            # self.requests[req_id] = CachedRequestState(
+            #     req_id=req_id,
+            #     prompt_token_ids=req_data.prompt_token_ids,
+            #     prompt=req_data.prompt,
+            #     # multi_modal_data=req_data.multi_modal_data,
+            #     multi_modal_data=req_data.mm_inputs,
+            #     sampling_params=sampling_params,
+            #     generator=generator,
+            #     block_ids=req_data.block_ids,
+            #     num_computed_tokens=req_data.num_computed_tokens,
+            #     output_token_ids=[],
+            # )
             self.requests[req_id] = CachedRequestState(
                 req_id=req_id,
-                prompt_token_ids=req_data.prompt_token_ids,
-                prompt=req_data.prompt,
-                # multi_modal_data=req_data.multi_modal_data,
-                multi_modal_data=req_data.mm_inputs,
+                prompt_token_ids=new_req_data.prompt_token_ids,
+                prompt=new_req_data.prompt,
+                mm_inputs=new_req_data.mm_inputs,
+                mm_positions=new_req_data.mm_positions,
                 sampling_params=sampling_params,
                 generator=generator,
-                block_ids=req_data.block_ids,
-                num_computed_tokens=req_data.num_computed_tokens,
+                block_ids=new_req_data.block_ids,
+                num_computed_tokens=new_req_data.num_computed_tokens,
                 output_token_ids=[],
             )
             req_ids_to_add.append(req_id)
 
         # Update the cached states of the resumed requests.
-        for req_data in scheduler_output.scheduled_resumed_reqs:
-            req_id = req_data.req_id
+        for res_req_data in scheduler_output.scheduled_resumed_reqs:
+            req_id = res_req_data.req_id
             req_state = self.requests[req_id]
 
-            req_state.block_ids = req_data.block_ids
-            req_state.num_computed_tokens = req_data.num_computed_tokens
+            req_state.block_ids = res_req_data.block_ids
+            req_state.num_computed_tokens = res_req_data.num_computed_tokens
             req_ids_to_add.append(req_id)
 
         # THIS MOVES ALL THE DECODES TO THE FIRST N IN BATCH.
@@ -295,6 +311,7 @@ class NeuronModelRunner:
         cu_prefix_kv_lens = None
         cu_suffix_kv_lens = None
 
+        from vllm.v1.attention.backends.flash_attn import FlashAttentionMetadata
         attn_metadata = FlashAttentionMetadata(
             num_actual_tokens=total_num_scheduled_tokens,
             max_query_len=max_num_scheduled_tokens,
@@ -333,94 +350,124 @@ class NeuronModelRunner:
         sampling_metadata = self.input_batch.make_sampling_metadata(skip_copy)
         return sampling_metadata
 
-    @torch.no_grad()
+    @torch.inference_mode()
     def execute_model(
         self,
         scheduler_output: "SchedulerOutput",
     ) -> ModelRunnerOutput:
         self._update_states(scheduler_output)
-        prefill_data, decode_data = self._prepare_inputs(scheduler_output)
+
+        if self.is_multimodal_model:
+            # Run the multimodal encoder if any.
+            self._execute_encoder(scheduler_output)
+            encoder_outputs = self._gather_encoder_outputs(scheduler_output)
+        else:
+            encoder_outputs = []
+
+        # Prepare the decoder inputs.
+        attn_metadata, logits_indices = self._prepare_inputs(scheduler_output)
+        num_scheduled_tokens = scheduler_output.total_num_scheduled_tokens
+        if (self.use_cuda_graph
+                and num_scheduled_tokens <= self.cudagraph_batch_sizes[-1]):
+            # Use piecewise CUDA graphs.
+            # Add padding to the batch size.
+            num_input_tokens = self.vllm_config.pad_for_cudagraph(
+                num_scheduled_tokens)
+        else:
+            # Eager mode.
+            num_input_tokens = num_scheduled_tokens
+        attn_metadata.num_input_tokens = num_input_tokens
+
+        if self.is_multimodal_model:
+            # NOTE(woosuk): To unify token ids and soft tokens (vision
+            # embeddings), we always use embeddings (rather than token ids)
+            # as input to the multimodal model, even when the input is text.
+            input_ids = self.input_ids[:num_scheduled_tokens]
+            if encoder_outputs:
+                inputs_embeds = self.model.get_input_embeddings(
+                    input_ids, encoder_outputs)
+            else:
+                inputs_embeds = self.model.get_input_embeddings(input_ids)
+            # TODO(woosuk): Avoid the copy. Optimize.
+            self.inputs_embeds[:num_scheduled_tokens].copy_(inputs_embeds)
+            inputs_embeds = self.inputs_embeds[:num_input_tokens]
+            input_ids = None
+        else:
+            # For text-only models, we use token ids as input.
+            # While it is possible to use embeddings as input just like the
+            # multimodal models, it is not desirable for performance since
+            # then the embedding layer is not included in the CUDA graph.
+            input_ids = self.input_ids[:num_input_tokens]
+            inputs_embeds = None
+
+        # Run the decoder.
+        # Use persistent buffers for CUDA graphs.
+        with set_forward_context(attn_metadata, self.vllm_config):
+            hidden_states = self.model(
+                input_ids=input_ids,
+                positions=self.positions[:num_input_tokens],
+                kv_caches=self.kv_caches,
+                attn_metadata=None,
+                inputs_embeds=inputs_embeds,
+            )
+        hidden_states = hidden_states[:num_scheduled_tokens]
+        hidden_states = hidden_states[logits_indices]
+        logits = self.model.compute_logits(hidden_states, None)
+
+        # Sample the next token and get logprobs if needed.
+        sampling_metadata = self._prepare_sampling(scheduler_output)
+        sampler_output = self.model.sample(
+            logits=logits,
+            sampling_metadata=sampling_metadata,
+        )
+
+        sampled_token_ids = sampler_output.sampled_token_ids
+        # TODO(woosuk): The following loop can be slow since it iterates over
+        # the requests one by one. Optimize.
         num_reqs = self.input_batch.num_reqs
-        sampled_token_ids = torch.empty(num_reqs, dtype=torch.int32)
-
-        ######################### DECODES #########################
-        # Decodes run as one single batch with [padded_batch, 1]
-        if decode_data.num_decodes > 0:
-
-            # FORWARD.
-            selected_token_ids = self.model(decode_data.token_ids,
-                                            decode_data.position_ids,
-                                            decode_data.attn_metadata,
-                                            self.kv_caches,
-                                            is_prompt=False)
-
-            # NOTE: TPU<>CPU sync happens here.
-            # We need to call .cpu() first to avoid recompilation.
-            token_ids = selected_token_ids.cpu()[:decode_data.num_decodes]
-            sampled_token_ids_list = token_ids.tolist()
-            # HACK AOYU add squeeze to last dimension
-            sampled_token_ids[:decode_data.num_decodes] = token_ids.squeeze(-1)
-
-            # UPDATE REQUEST STATE.
-            for i, req_id in enumerate(
-                    self.input_batch.req_ids[:decode_data.num_decodes]):
-                req_state = self.requests[req_id]
-
-                # TODO: ASSERT NO CHUNKED PREFILL.
-                assert scheduler_output.num_scheduled_tokens[req_id] == 1
-                seq_len = (req_state.num_computed_tokens +
-                           scheduler_output.num_scheduled_tokens[req_id])
-                assert seq_len == req_state.num_tokens
-
-                token_id = sampled_token_ids_list[i][0]
-                # HACK AOYU, assume one token per decoding
-                self.input_batch.token_ids_cpu[i, seq_len] = token_id
-                req_state.output_token_ids.append(token_id)
-
-        ######################### PREFILLS #########################
-        # Prefills run separately with shape [1, padded_prefill_len],
-        # due to lack of variable length attention kernel so far.
-        for idx, (req_id, prompt_len, token_ids, position_ids,
-                  attn_metadata) in enumerate(prefill_data.zipped()):
-
-            # FORWARD.
-            selected_token_ids = self.model(token_ids,
-                                            position_ids,
-                                            attn_metadata,
-                                            self.kv_caches,
-                                            is_prompt=True)
-
-            # NOTE: TPU<>CPU sync happens here.
-            # We need to call .cpu() first to avoid recompilation.
-            token_id = selected_token_ids.cpu()[prompt_len - 1].item()
-            sampled_token_ids[decode_data.num_decodes + idx] = token_id
+        for i, req_id in enumerate(self.input_batch.req_ids[:num_reqs]):
+            assert req_id is not None
             req_state = self.requests[req_id]
-
-            # TODO: ASSERT NO PREFIX CACHING.
-            assert req_state.num_computed_tokens == 0
             seq_len = (req_state.num_computed_tokens +
                        scheduler_output.num_scheduled_tokens[req_id])
+            assert seq_len <= req_state.num_tokens
+            if seq_len == req_state.num_tokens:
+                # Append the sampled token to the output token ids.
+                token_id = sampled_token_ids[i]
+                self.input_batch.token_ids_cpu[i, seq_len] = token_id
+                self.input_batch.num_tokens[i] += 1
+                req_state.output_token_ids.append(token_id)
+            else:
+                # Ignore the sampled token from the partial request.
+                # Rewind the generator state as if the token was not sampled.
+                generator = self.input_batch.generators.get(i)
+                if generator is not None:
+                    # This relies on cuda-specific torch-internal impl details
+                    generator.set_offset(generator.get_offset() - 4)
 
-            # TODO: ASSERT NO CHUNKED PREFILL.
-            assert seq_len == req_state.num_tokens
-            assert prompt_len == seq_len
+        if sampler_output.logprob_token_ids is None:
+            logprob_token_ids = None
+        else:
+            logprob_token_ids = sampler_output.logprob_token_ids.cpu()
+        if sampler_output.logprobs is None:
+            logprobs = None
+        else:
+            logprobs = sampler_output.logprobs.cpu()
 
-            # UPDATE REQUEST STATE.
-            req_idx = self.input_batch.req_id_to_index[req_id]
-            self.input_batch.token_ids_cpu[req_idx, seq_len] = token_id
-            req_state.output_token_ids.append(token_id)
-        
-        output_list = sampled_token_ids.tolist()
-        if not isinstance(output_list, list):
-            output_list = [output_list]
+        # num_reqs entries should be non-None
+        assert all(
+            req_id is not None for req_id in
+            self.input_batch.req_ids[:num_reqs]), "req_ids contains None"
+        req_ids = cast(List[str], self.input_batch.req_ids[:num_reqs])
 
-        return ModelRunnerOutput(
-            req_ids=self.input_batch.req_ids[:num_reqs],
+        model_runner_output = ModelRunnerOutput(
+            req_ids=req_ids,
             req_id_to_index=self.input_batch.req_id_to_index,
-            sampled_token_ids=output_list,
-            logprob_token_ids_cpu=None,
-            logprobs_cpu=None,
+            sampled_token_ids=sampled_token_ids,
+            logprob_token_ids_cpu=logprob_token_ids,
+            logprobs_cpu=logprobs,
         )
+        return model_runner_output
 
     def load_model(self) -> None:
 

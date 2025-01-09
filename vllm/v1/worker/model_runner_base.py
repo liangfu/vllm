@@ -17,8 +17,8 @@ from vllm.multimodal import MULTIMODAL_REGISTRY, MultiModalKwargs
 from vllm.sampling_params import SamplingType
 from vllm.utils import (STR_DTYPE_TO_TORCH_DTYPE, DeviceMemoryProfiler,
                         LayerBlockType, cdiv, is_pin_memory_available)
-from vllm.v1.attention.backends.flash_attn import (FlashAttentionBackend,
-                                                   FlashAttentionMetadata)
+# from vllm.v1.attention.backends.flash_attn import (FlashAttentionBackend,
+#                                                    FlashAttentionMetadata)
 from vllm.v1.engine.mm_input_mapper import MMHasher, MMInputMapperClient
 from vllm.v1.outputs import ModelRunnerOutput
 from vllm.v1.sample.metadata import SamplingMetadata
@@ -30,7 +30,7 @@ if TYPE_CHECKING:
 logger = init_logger(__name__)
 
 
-class GPUModelRunner:
+class ModelRunnerBase:
 
     def __init__(
         self,
@@ -110,19 +110,8 @@ class GPUModelRunner:
             vocab_size=model_config.get_vocab_size(),
         )
 
-        self.use_cuda_graph = (self.vllm_config.compilation_config.level
-                               == CompilationLevel.PIECEWISE
-                               and not self.model_config.enforce_eager)
-        # TODO(woosuk): Provide an option to tune the max cudagraph batch size.
-        # The convention is different.
-        # self.cudagraph_batch_sizes sorts in ascending order.
-        # The batch sizes in the config are in descending order.
-        self.cudagraph_batch_sizes = list(
-            reversed(self.vllm_config.compilation_config.capture_sizes))
-
         # Cache the device properties.
-        self.device_properties = torch.cuda.get_device_properties(self.device)
-        self.num_sms = self.device_properties.multi_processor_count
+        self._cache_device_properties()
 
         # Persistent buffers for CUDA graphs.
         self.input_ids = torch.zeros(self.max_num_tokens,
@@ -168,6 +157,22 @@ class GPUModelRunner:
                                              device="cpu",
                                              pin_memory=self.pin_memory)
         self.seq_start_loc_np = self.seq_start_loc_cpu.numpy()
+
+    def _cache_device_properties(self) -> None:
+        pass
+        # self.use_cuda_graph = (self.vllm_config.compilation_config.level
+        #                        == CompilationLevel.PIECEWISE
+        #                        and not self.model_config.enforce_eager)
+        # # TODO(woosuk): Provide an option to tune the max cudagraph batch size.
+        # # The convention is different.
+        # # self.cudagraph_batch_sizes sorts in ascending order.
+        # # The batch sizes in the config are in descending order.
+        # self.cudagraph_batch_sizes = list(
+        #     reversed(self.vllm_config.compilation_config.capture_sizes))
+
+        # # Cache the device properties.
+        # self.device_properties = torch.cuda.get_device_properties(self.device)
+        # self.num_sms = self.device_properties.multi_processor_count
 
     def _update_states(self, scheduler_output: "SchedulerOutput") -> None:
         # Remove stopped requests from the cached states.
