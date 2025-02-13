@@ -43,7 +43,8 @@ def get_current_memory_usage(rank):
         else:
             memory_used = runtime_data[0]['report']['memory_used']['neuron_runtime_used_bytes']['neuron_device']
 
-        total_memory = hardware_info['neuron_device_memory_size'] * hardware_info['logical_neuroncore_config'] // hardware_info['neuroncore_per_device_count']
+        # total_memory = hardware_info['neuron_device_memory_size'] * hardware_info['logical_neuroncore_config'] // hardware_info['neuroncore_per_device_count']
+        total_memory = hardware_info['neuron_device_memory_size'] // hardware_info['neuroncore_per_device_count']
     return memory_used, total_memory
 
 
