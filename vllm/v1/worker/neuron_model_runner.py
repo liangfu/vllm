@@ -15,22 +15,20 @@ from vllm.logger import init_logger
 from vllm.model_executor.model_loader import get_model
 from vllm.multimodal import MultiModalKwargs
 from vllm.sampling_params import SamplingType
-from vllm.utils import (STR_DTYPE_TO_TORCH_DTYPE, 
-                        LayerBlockType, cdiv)
-from vllm.v1.attention.backends.neuron_attn import NeuronAttentionBackend, \
-    NeuronAttentionMetadata
+from vllm.utils import STR_DTYPE_TO_TORCH_DTYPE, LayerBlockType, cdiv
+from vllm.v1.attention.backends.neuron_attn import (NeuronAttentionBackend,
+                                                    NeuronAttentionMetadata)
+from vllm.v1.kv_cache_interface import (FullAttentionSpec, KVCacheConfig,
+                                        KVCacheSpec)
 from vllm.v1.outputs import ModelRunnerOutput
 from vllm.v1.sample.metadata import SamplingMetadata
 from vllm.v1.utils import bind_kv_cache
 from vllm.v1.worker.gpu_input_batch import CachedRequestState, InputBatch
-from vllm.v1.kv_cache_interface import (FullAttentionSpec, KVCacheConfig,
-                                        KVCacheSpec)
 
 if TYPE_CHECKING:
     from vllm.v1.core.scheduler import SchedulerOutput
 
 logger = init_logger(__name__)
-
 
 B_P_SIZE = 128
 LARGE_TILE_SZ = 2048
@@ -115,7 +113,9 @@ class NeuronModelRunner:
             device="cpu")
 
         # TODO(gnovack) - use compile sizes...
-        self.neuron_compilation_batch_sizes = list(reversed(self.vllm_config.compilation_config.cudagraph_capture_sizes))
+        self.neuron_compilation_batch_sizes = list(
+            reversed(
+                self.vllm_config.compilation_config.cudagraph_capture_sizes))
 
     def _update_states(self, scheduler_output: "SchedulerOutput") -> None:
         # Remove stopped requests from the cached states.
@@ -279,9 +279,9 @@ class NeuronModelRunner:
         # where K is the max_num_blocks_per_req and the block size is 2.
         # NOTE(woosuk): We can't simply use `token_indices // block_size` here
         # because M (max_model_len) is not necessarily divisible by block_size.
-        block_numbers = self.input_batch.block_table.get_cpu_tensor().flatten()[
-            req_indices * self.max_num_blocks_per_req +
-            positions_np // self.block_size]
+        block_numbers = self.input_batch.block_table.get_cpu_tensor().flatten(
+        )[req_indices * self.max_num_blocks_per_req +
+          positions_np // self.block_size]
         block_offsets = torch.from_numpy(positions_np % self.block_size)
         slot_mapping = torch.empty((total_num_scheduled_tokens, ),
                                    dtype=torch.int32,
@@ -290,16 +290,14 @@ class NeuronModelRunner:
         torch.add(block_numbers * self.block_size,
                   block_offsets,
                   out=slot_mapping)
-        
+
         _PAD_SLOT_ID = self.num_blocks * self.block_size
-        padded_num_tokens = self._get_padded_batch_size(total_num_scheduled_tokens)
+        padded_num_tokens = self._get_padded_batch_size(
+            total_num_scheduled_tokens)
         slot_mapping_pad_length = padded_num_tokens - slot_mapping.shape[0]
-        slot_mapping = torch.nn.functional.pad(
-            slot_mapping,
-            (0, slot_mapping_pad_length),
-            'constant',
-            _PAD_SLOT_ID
-        )
+        slot_mapping = torch.nn.functional.pad(slot_mapping,
+                                               (0, slot_mapping_pad_length),
+                                               'constant', _PAD_SLOT_ID)
 
         # Prepare the attention metadata.
         query_start_loc = torch.empty((num_reqs + 1, ),
@@ -330,14 +328,15 @@ class NeuronModelRunner:
         query_lens = torch.diff(query_start_loc)
         context_lens = seq_lens - query_lens
         num_active_blocks_shifted = shift_bit_length(
-            ((context_lens+ self.block_size - 1) // self.block_size).sum().item()
-        )
-        num_active_blocks_factor = max(LARGE_TILE_SZ // self.block_size // num_active_blocks_shifted, 1)
+            ((context_lens + self.block_size - 1) //
+             self.block_size).sum().item())
+        num_active_blocks_factor = max(
+            LARGE_TILE_SZ // self.block_size // num_active_blocks_shifted, 1)
         num_active_blocks = num_active_blocks_shifted * num_active_blocks_factor
-        assert (num_active_blocks * self.block_size) % LARGE_TILE_SZ == 0, "invalid {num_active_blocks=}"
+        assert (num_active_blocks * self.block_size
+                ) % LARGE_TILE_SZ == 0, "invalid {num_active_blocks=}"
 
         context_kv_len = num_active_blocks * self.block_size
-
 
         block_table = self.input_batch.block_table.get_cpu_tensor()[:num_reqs]
         active_block_table = get_active_block_tables(
@@ -350,17 +349,18 @@ class NeuronModelRunner:
 
         prior_mask, active_mask = (
             BlockDiagonalCausalFromBottomRightMask.from_seqlens(
-                query_lens=query_lens.tolist(), seq_lens=seq_lens.tolist(), block_size=self.block_size
-            )
-        )
-        
+                query_lens=query_lens.tolist(),
+                seq_lens=seq_lens.tolist(),
+                block_size=self.block_size))
+
         attn_mask = torch.concat(
             [
                 nn.functional.pad(
                     prior_mask,
                     (
                         0,
-                        max(context_kv_len, LARGE_TILE_SZ) - prior_mask.shape[1],
+                        max(context_kv_len, LARGE_TILE_SZ) -
+                        prior_mask.shape[1],
                         0,
                         B_P_SIZE - prior_mask.shape[0],
                     ),
@@ -381,12 +381,13 @@ class NeuronModelRunner:
             ],
             dim=1,
         )
-        
+
         logits_indices = query_start_loc[1:] - 1
         query_start_loc = query_start_loc.to(self.device, non_blocking=True)
         seq_start_loc = seq_start_loc.to(self.device, non_blocking=True)
         slot_mapping = slot_mapping.long().to(self.device, non_blocking=True)
-        active_block_table = active_block_table.to(torch.int32).to(self.device, non_blocking=True)
+        active_block_table = active_block_table.to(torch.int32).to(
+            self.device, non_blocking=True)
         attn_mask = attn_mask.to(self.device)
         attn_metadata = NeuronAttentionMetadata(
             num_actual_tokens=total_num_scheduled_tokens,
@@ -394,12 +395,12 @@ class NeuronModelRunner:
             query_start_loc=query_start_loc,
             max_seq_len=max_seq_len,
             seq_start_loc=seq_start_loc,
-            block_table=self.input_batch.block_table.get_device_tensor()[:num_reqs],
+            block_table=self.input_batch.block_table.get_device_tensor()
+            [:num_reqs],
             slot_mapping=slot_mapping,
             num_active_blocks=num_active_blocks,
             active_block_table=active_block_table,
-            attn_mask=attn_mask
-        )
+            attn_mask=attn_mask)
         # NOTE(woosuk): Due to chunked prefills, there can be at most 1 partial
         # request in the batch. While we should not sample any token from this
         # partial request, we do so for simplicity. We will ignore the sampled
@@ -422,8 +423,9 @@ class NeuronModelRunner:
         req_id_output_token_ids: Dict[str, List[int]] = \
             {req_id: req.output_token_ids \
                 for req_id, req in self.requests.items()}
-        
-        sampling_metadata = self.input_batch.make_sampling_metadata(req_id_output_token_ids, skip_copy)
+
+        sampling_metadata = self.input_batch.make_sampling_metadata(
+            req_id_output_token_ids, skip_copy)
         return sampling_metadata
 
     def _execute_encoder(self, scheduler_output: "SchedulerOutput"):
@@ -516,7 +518,7 @@ class NeuronModelRunner:
         attn_metadata, logits_indices = self._prepare_inputs(scheduler_output)
         num_scheduled_tokens = scheduler_output.total_num_scheduled_tokens
         num_input_tokens = self._get_padded_batch_size(num_scheduled_tokens)
-        
+
         attn_metadata.num_input_tokens = num_input_tokens
 
         if self.is_multimodal_model:
@@ -543,10 +545,12 @@ class NeuronModelRunner:
         with set_forward_context(attn_metadata, self.vllm_config):
             hidden_states = self.model(
                 input_ids=input_ids.unsqueeze(0).to(self.device),
-                positions=self.positions[:num_input_tokens].unsqueeze(0).to(self.device),
+                positions=self.positions[:num_input_tokens].unsqueeze(0).to(
+                    self.device),
                 kv_caches=self.kv_caches,
                 attn_metadata=attn_metadata,
-                inputs_embeds=inputs_embeds.to(self.device) if inputs_embeds is not None else None,
+                inputs_embeds=inputs_embeds.to(self.device)
+                if inputs_embeds is not None else None,
             ).cpu()
         hidden_states = hidden_states[0, :num_scheduled_tokens]
         hidden_states = hidden_states[logits_indices.cpu()]
@@ -601,10 +605,14 @@ class NeuronModelRunner:
     def load_model(self) -> None:
         # TODO(gnovack) - Add memory profiler during model load
         with torch.inference_mode():
-            logger.info("Starting to load model %s...", self.model_config.model)
-            model = get_model(vllm_config=self.vllm_config).eval().to(self.device)
-            self.model = torch.compile(model, backend="openxla", fullgraph=True, dynamic=False)
-
+            logger.info("Starting to load model %s...",
+                        self.model_config.model)
+            model = get_model(vllm_config=self.vllm_config).eval().to(
+                self.device)
+            self.model = torch.compile(model,
+                                       backend="openxla",
+                                       fullgraph=True,
+                                       dynamic=False)
 
     @torch.inference_mode()
     def _dummy_run(
@@ -613,13 +621,14 @@ class NeuronModelRunner:
         num_tokens: int,
         kv_caches: List[torch.Tensor],
     ) -> torch.Tensor:
-        
+
         num_active_blocks_shifted = shift_bit_length(
-            ((self.block_size - 1) // self.block_size)
-        )
-        num_active_blocks_factor = (LARGE_TILE_SZ // self.block_size // num_active_blocks_shifted)
+            (self.block_size - 1) // self.block_size)
+        num_active_blocks_factor = (LARGE_TILE_SZ // self.block_size //
+                                    num_active_blocks_shifted)
         num_active_blocks = num_active_blocks_shifted * num_active_blocks_factor
-        block_table = torch.arange((num_tokens // self.block_size) + 1).unsqueeze(0)
+        block_table = torch.arange((num_tokens // self.block_size) +
+                                   1).unsqueeze(0)
         active_block_table = get_active_block_tables(
             block_table,
             torch.tensor([num_tokens]),
@@ -628,9 +637,8 @@ class NeuronModelRunner:
             num_active_blocks,
         )
 
-        attn_mask, _  = BlockDiagonalCausalFromBottomRightMask.from_seqlens(
-            query_lens=[num_tokens], seq_lens=[num_tokens]
-        )
+        attn_mask, _ = BlockDiagonalCausalFromBottomRightMask.from_seqlens(
+            query_lens=[num_tokens], seq_lens=[num_tokens])
         attn_mask = nn.functional.pad(
             attn_mask,
             (
@@ -646,15 +654,21 @@ class NeuronModelRunner:
         attn_metadata = NeuronAttentionMetadata(
             num_actual_tokens=num_tokens,
             max_query_len=num_tokens,
-            query_start_loc=torch.tensor([0, num_tokens-1]).to(self.device, non_blocking=True),
+            query_start_loc=torch.tensor([0, num_tokens - 1
+                                          ]).to(self.device,
+                                                non_blocking=True),
             max_seq_len=num_tokens,
-            seq_start_loc=torch.tensor([0, num_tokens-1]).to(self.device, non_blocking=True),
+            seq_start_loc=torch.tensor([0,
+                                        num_tokens - 1]).to(self.device,
+                                                            non_blocking=True),
             block_table=block_table,
-            slot_mapping=torch.arange(0, num_tokens).long().to(self.device, non_blocking=True),
+            slot_mapping=torch.arange(0,
+                                      num_tokens).long().to(self.device,
+                                                            non_blocking=True),
             num_active_blocks=num_active_blocks,
-            active_block_table=active_block_table.to(torch.int32).to(self.device, non_blocking=True),
-            attn_mask=attn_mask.to(self.device, non_blocking=True)
-        )
+            active_block_table=active_block_table.to(torch.int32).to(
+                self.device, non_blocking=True),
+            attn_mask=attn_mask.to(self.device, non_blocking=True))
 
         if self.is_multimodal_model:
             input_ids = None
@@ -665,19 +679,24 @@ class NeuronModelRunner:
         with set_forward_context(attn_metadata, self.vllm_config):
             hidden_states = model(
                 input_ids=input_ids.unsqueeze(0).to(self.device),
-                positions=self.positions[:num_tokens].unsqueeze(0).to(self.device),
+                positions=self.positions[:num_tokens].unsqueeze(0).to(
+                    self.device),
                 kv_caches=kv_caches,
                 attn_metadata=attn_metadata,
-                inputs_embeds=inputs_embeds.to(self.device) if inputs_embeds is not None else None,
+                inputs_embeds=inputs_embeds.to(self.device)
+                if inputs_embeds is not None else None,
             )
         return hidden_states
 
     def profile_run(self) -> None:
         # TODO(gnovack): implement profiling run for neuron
-        dummy_kv_caches = [
-            (torch.tensor([], dtype=torch.float32, device=self.device), torch.tensor([], dtype=torch.float32, device=self.device))
-            for _ in range(self.num_attn_layers)
-        ]
+        dummy_kv_caches = [(torch.tensor([],
+                                         dtype=torch.float32,
+                                         device=self.device),
+                            torch.tensor([],
+                                         dtype=torch.float32,
+                                         device=self.device))
+                           for _ in range(self.num_attn_layers)]
         num_tokens = max(self.neuron_compilation_batch_sizes)
         self._dummy_run(self.model, num_tokens, dummy_kv_caches)
 
@@ -701,13 +720,15 @@ class NeuronModelRunner:
 
         with torch.inference_mode():
             kv_cache_shape = NeuronAttentionBackend.get_kv_cache_shape(
-                self.num_blocks + 1, self.block_size, self.num_kv_heads, self.head_size)
-            for layer_name, layer_spec in kv_cache_config.kv_cache_spec.items():
+                self.num_blocks + 1, self.block_size, self.num_kv_heads,
+                self.head_size)
+            for layer_name, layer_spec in kv_cache_config.kv_cache_spec.items(
+            ):
                 cache = torch.zeros(kv_cache_shape,
-                                dtype=self.kv_cache_dtype,
-                                device='cpu')
+                                    dtype=self.kv_cache_dtype,
+                                    device='cpu')
                 kv_caches[layer_name] = cache.to(self.device)
-        
+
         bind_kv_cache(
             kv_caches,
             self.vllm_config.compilation_config.static_forward_context,
@@ -749,7 +770,7 @@ class NeuronModelRunner:
 
 
 def get_active_block_tables(block_tables, query_lens, seq_lens, block_size,
-                                    num_blocks):
+                            num_blocks):
     context_lens = seq_lens - query_lens
     blocks_per_seq = (context_lens + block_size - 1) // block_size
     num_seqs = len(seq_lens)
@@ -831,6 +852,7 @@ class BlockDiagonalCausalFromBottomRightMask:
             active_mask = BlockDiagonalCausalFromBottomRightMask._from_seqlens(
                 query_lens, query_lens)
         return prior_mask, active_mask
+
 
 def shift_bit_length(x):
     return 1 << (x - 1).bit_length()

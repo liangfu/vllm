@@ -2,8 +2,10 @@ from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Tuple, Type
 
 import torch
-from vllm.attention.backends.abstract import AttentionBackend\
-    , AttentionImpl, AttentionMetadataBuilder, AttentionType
+
+from vllm.attention.backends.abstract import (AttentionBackend, AttentionImpl,
+                                              AttentionMetadataBuilder,
+                                              AttentionType)
 from vllm.attention.backends.utils import CommonAttentionState
 
 
@@ -41,6 +43,7 @@ def neuron_paged_attn(
     )
     return torch.tensor(output_nki)
 
+
 @neuron_paged_attn.register_fake
 def _(
     query: torch.Tensor,
@@ -61,7 +64,7 @@ def _(
 
 
 class NeuronAttentionBackend(AttentionBackend):
-    
+
     @staticmethod
     def get_name() -> str:
         return "NEURON"
@@ -91,6 +94,7 @@ class NeuronAttentionBackend(AttentionBackend):
     ) -> Tuple[int, ...]:
         return (2, num_blocks, block_size, num_kv_heads, head_size)
 
+
 @dataclass
 class NeuronAttentionMetadata:
     # NOTE(sang): Definition of context_len, query_len, and seq_len.
@@ -113,11 +117,14 @@ class NeuronAttentionMetadata:
     attn_mask: torch.Tensor
     num_input_tokens: int = 0  # Number of tokens including padding.
 
-class NeuronAttentionMetadataBuilder(AttentionMetadataBuilder[NeuronAttentionMetadata]):
+
+class NeuronAttentionMetadataBuilder(
+        AttentionMetadataBuilder[NeuronAttentionMetadata]):
     ...
 
+
 class NeuronAttentionBackendImpl(AttentionImpl[NeuronAttentionMetadata]):
-    
+
     def __init__(
         self,
         num_heads: int,
@@ -136,7 +143,7 @@ class NeuronAttentionBackendImpl(AttentionImpl[NeuronAttentionMetadata]):
         self.num_kv_heads = num_kv_heads
         self.scale = scale
         self.num_queries_per_kv = self.num_heads // self.num_kv_heads
-    
+
     @torch.inference_mode()
     def forward(
         self,
@@ -151,14 +158,14 @@ class NeuronAttentionBackendImpl(AttentionImpl[NeuronAttentionMetadata]):
         attn_type: str = AttentionType.DECODER,
         output: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-   
+
         k_cache = kv_cache[0]
         v_cache = kv_cache[1]
-        
+
         num_tokens = query.shape[1]
         key = key.view(num_tokens, self.num_kv_heads, self.head_size)
         value = value.view(num_tokens, self.num_kv_heads, self.head_size)
-            
+
         if kv_cache[0].numel() > 0:
             torch.ops.xla.dynamo_set_buffer_donor_(kv_cache, True)
             slot_mapping = attn_metadata.slot_mapping
@@ -187,9 +194,11 @@ class NeuronAttentionBackendImpl(AttentionImpl[NeuronAttentionMetadata]):
             mixed_precision=False,
         )
         output = neuron_paged_attn(*input_args, **input_kwargs)
-        output = output.transpose(1,2).reshape(1, num_tokens, self.num_heads * self.head_size)
+        output = output.transpose(1,
+                                  2).reshape(1, num_tokens,
+                                             self.num_heads * self.head_size)
         return output
-        
+
 
 def write_to_kv_cache(
     key: torch.Tensor,

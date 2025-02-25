@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 import os
+
 from vllm import LLM, SamplingParams
 
 os.environ["VLLM_USE_V1"] = "1"
@@ -24,8 +25,7 @@ llm = LLM(model="TinyLlama/TinyLlama-1.1B-Chat-v1.0",
           tensor_parallel_size=1,
           disable_async_output_proc=True,
           enable_chunked_prefill=True,
-          worker_cls="vllm.v1.worker.neuron_worker.NeuronWorker"
-)
+          worker_cls="vllm.v1.worker.neuron_worker.NeuronWorker")
 
 # Generate texts from the prompts. The output is a list of RequestOutput objects
 # that contain the prompt, generated text, and other information.
