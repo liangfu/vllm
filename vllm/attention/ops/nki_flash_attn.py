@@ -140,6 +140,39 @@ def transform_block_tables_for_indirect_load(
     return block_tables_transposed
 
 
+def nki_load_and_transform_block_tables(
+    block_tables,
+    num_tiles,
+    num_blocks_per_tile,
+    num_head,
+    head_id,
+    block_size_tiling_factor,
+):
+    import neuronxcc.nki.language as nl
+
+    assert is_power_of_2(
+        num_blocks_per_tile), f"{num_blocks_per_tile=} must be power of 2"
+    block_tables_sbuf = load_block_tables(block_tables, num_tiles,
+                                          num_blocks_per_tile)
+
+    # we need to pass an Index as head_id
+    head_id = nl.arange(1)[None, :] + head_id
+
+    block_tables_transposed = transform_block_tables_for_indirect_load(
+        block_tables_sbuf, block_size_tiling_factor, num_head, head_id)
+    B_P_SIZE = 128
+    assert block_tables_transposed.shape[1] == B_P_SIZE
+
+    out = nl.ndarray(
+        block_tables_transposed.shape,
+        dtype=nl.int32,
+        buffer=nl.shared_hbm,
+    )
+    for i in nl.affine_range(block_tables_transposed.shape[0]):
+        nl.store(dst=out[i], value=block_tables_transposed[i])
+    return out
+
+
 @nki.jit
 def load_kv_tile_from_cache(
     cur_k_tile,
@@ -422,6 +455,8 @@ def flash_paged_attention(
     value_cache,
     block_tables,
     mask,
+    query_lens,
+    seq_lens,
     softmax_scale=None,
     mixed_precision=True,
     LARGE_TILE_SZ=2048,
@@ -824,7 +859,9 @@ def flash_attn_varlen_nkifunc(
     key_cache,
     value_cache,
     block_table,
-    attn_mask,
+    attn_mask=None,
+    query_lens=None,
+    seq_lens=None,
     n_kv_head=None,
     head_size=None,
     LARGE_TILE_SZ=2048,
@@ -862,6 +899,8 @@ def flash_attn_varlen_nkifunc(
         value_cache=value_cache,
         block_tables=block_table,
         mask=attn_mask,
+        query_lens=query_lens,
+        seq_lens=seq_lens,
         softmax_scale=1.0 / (head_size**0.5),
         mixed_precision=mixed_precision,
         LARGE_TILE_SZ=LARGE_TILE_SZ,
