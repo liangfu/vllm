@@ -460,7 +460,7 @@ def flash_paged_attention(
     softmax_scale=None,
     mixed_precision=True,
     LARGE_TILE_SZ=2048,
-    return_debug_tensors=False,
+    return_softmax_lse=False,
 ):
     """
     Flash PagedAttention Forward Kernel.
@@ -574,7 +574,7 @@ def flash_paged_attention(
         None,
         None,
     )
-    if return_debug_tensors:
+    if return_softmax_lse:
         hbm_l_buffer = nl.ndarray((b, h, seqlen_q),
                                   dtype=acc_type,
                                   buffer=nl.shared_hbm)
@@ -782,7 +782,7 @@ def flash_paged_attention(
                 out,
             )
             # maximum and summation statistics
-            if return_debug_tensors:
+            if return_softmax_lse:
                 nl.store(
                     hbm_m_buffer[
                         batch_id,
@@ -804,7 +804,7 @@ def flash_paged_attention(
                     qk_res_buffer[batch_id, i_q_h, :, :],
                 )
 
-    if return_debug_tensors:
+    if return_softmax_lse:
         return o, hbm_m_buffer, hbm_l_buffer, hbm_qk_res
     return o
 
@@ -853,56 +853,51 @@ def reorder_context_mask(mask, LARGE_TILE_SZ, block_size):
 
 
 def flash_attn_varlen_nkifunc(
-    query,
-    key,
-    value,
-    key_cache,
-    value_cache,
-    block_table,
-    attn_mask=None,
-    query_lens=None,
-    seq_lens=None,
-    n_kv_head=None,
-    head_size=None,
-    LARGE_TILE_SZ=2048,
-    mixed_precision=True,
+    q,
+    k,
+    v,
+    k_cache,
+    v_cache,
+    cu_seqlens_q=None,
+    seqused_k=None,
+    max_seqlen_q=None,
+    max_seqlen_k=None,
+    block_table=None,
 ):
     """
     Compute flash paged attention for variable length sequences.
 
     This function is a wrapper around the flash attention NKI kernel. It takes
     in the following arguments:
-      - query: (1, n_heads, d, seq_q)
-      - key:   (1, n_kv_heads, d, seq_k)
-      - value: (1, n_kv_heads, seq_v, d)
+      - q: (1, n_heads, d, seq_q)
+      - k: (1, n_kv_heads, d, seq_k)
+      - v: (1, n_kv_heads, seq_v, d)
       - key_cache:   (n_blocks, n_kv_heads, block_size, d)
       - value_cache: (n_blocks, n_kv_heads, block_size, d)
       - block_tables: (n_active_blocks, )
-      - attn_mask: (seq_q, n_active_blocks * block_size + seq_q)
 
     Notes:
-      - attn_mask must be reordered outside using `reorder_context_mask`
       - Key/value cache layout must be (n_blocks, n_kv_heads, block_size, d) 
         for better DMA throughput
     """
-    if n_kv_head is None:
-        n_kv_head = key_cache.shape[1]
-    assert key_cache.shape[1] == n_kv_head
-    if head_size is None:
-        head_size = key_cache.shape[-1]
+    LARGE_TILE_SZ = 2048
+    n_kv_head = key_cache.shape[1]
+    head_size = key_cache.shape[-1]
 
     kwargs = dict(
-        query=query,
-        key=key,
-        value=value,
-        key_cache=key_cache,
-        value_cache=value_cache,
+        q=query,
+        k=key,
+        v=value,
+        k_cache=key_cache,
+        v_cache=value_cache,
         block_tables=block_table,
         mask=attn_mask,
-        query_lens=query_lens,
-        seq_lens=seq_lens,
+        cu_seqlens_q=cu_seqlens_q,
+        seqused_k=seqused_k,
+        max_seqlen_q=max_seqlen_q,
+        max_seqlen_k=max_seqlen_k,
         softmax_scale=1.0 / (head_size**0.5),
-        mixed_precision=mixed_precision,
+        mixed_precision=True,
         LARGE_TILE_SZ=LARGE_TILE_SZ,
     )
 
