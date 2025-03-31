@@ -840,21 +840,40 @@ class NeuronModelRunner:
         logger.info("Neuron compilation finished in %.0f secs", elapsed_time)
 
     def initialize_kv_cache(self, kv_cache_config: KVCacheConfig) -> None:
+        """
+        Initialize KV cache based on `kv_cache_config`.
+        Args:
+            kv_cache_config: Configuration for the KV cache, including the KV
+            cache size of each layer
+        """
         assert len(self.kv_caches) == 0
         self.num_blocks = kv_cache_config.num_blocks
+        if len(kv_cache_config.kv_cache_groups) > 1:
+            raise NotImplementedError(
+                "Hybrid models with more than one KV cache type are not "
+                "supported yet.")
 
         kv_caches: dict[str, torch.Tensor] = {}
 
-        with torch.inference_mode():
-            kv_cache_shape = NeuronAttentionBackend.get_kv_cache_shape(
-                self.num_blocks + 1, self.block_size, self.num_kv_heads,
-                self.head_size)
-            for layer_name, layer_spec in kv_cache_config.kv_cache_spec.items(
-            ):
-                cache = torch.zeros(kv_cache_shape,
-                                    dtype=self.kv_cache_dtype,
-                                    device='cpu')
-                kv_caches[layer_name] = cache.to(self.device)
+        for kv_cache_group in kv_cache_config.kv_cache_groups:
+            kv_cache_spec = kv_cache_group.kv_cache_spec
+            for layer_name in kv_cache_group.layer_names:
+                tensor_config = kv_cache_config.tensors[layer_name]
+                assert tensor_config.size % kv_cache_spec.page_size_bytes == 0
+                num_blocks = tensor_config.size // kv_cache_spec.page_size_bytes
+                if isinstance(kv_cache_spec, FullAttentionSpec):
+                    kv_cache_shape = NeuronAttentionBackend.get_kv_cache_shape(
+                        self.num_blocks + 1, self.block_size,
+                        kv_cache_spec.num_kv_heads, kv_cache_spec.head_size)
+                    dtype = kv_cache_spec.dtype
+
+                    neuron_kv_cache = torch.zeros(kv_cache_shape,
+                                               dtype=dtype,
+                                               device=self.device)
+
+                    kv_caches[layer_name] = neuron_kv_cache
+                else:
+                    raise NotImplementedError
 
         bind_kv_cache(
             kv_caches,
