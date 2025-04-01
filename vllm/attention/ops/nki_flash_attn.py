@@ -908,15 +908,9 @@ def reshape_and_cache(
 
     # Update caches using index_put_
     kv_cache.index_put_(
-        (torch.tensor([0], device=key.device),
-         block_indices[:, None],
-         head_indices[None, :],
-         block_offsets[:, None]
-        ), key)
+        (torch.tensor([0], device=key.device), block_indices[:, None],
+         head_indices[None, :], block_offsets[:, None]), key)
 
     kv_cache.index_put_(
-        (torch.tensor([1], device=key.device),
-         block_indices[:, None],
-         head_indices[None, :],
-         block_offsets[:, None]
-        ), value)
+        (torch.tensor([1], device=key.device), block_indices[:, None],
+         head_indices[None, :], block_offsets[:, None]), value)

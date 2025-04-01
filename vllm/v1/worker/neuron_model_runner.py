@@ -612,7 +612,7 @@ class NeuronModelRunner:
                 encoder_outputs.append(encoder_output[start_idx:end_idx])
         return encoder_outputs
 
-    @torch.no_grad()
+    @torch.inference_mode()
     def execute_model(
         self,
         scheduler_output: "SchedulerOutput",
@@ -661,16 +661,15 @@ class NeuronModelRunner:
             positions = self.positions[:num_input_tokens]
 
         # Run the decoder.
-        with torch.inference_mode():
-            with set_forward_context(attn_metadata, self.vllm_config):
-                hidden_states = self.model(
-                    input_ids=input_ids.unsqueeze(0).to(self.device),
-                    positions=positions[:num_input_tokens].unsqueeze(0).to(
-                        self.device),
-                    intermediate_tensors=None,
-                    inputs_embeds=inputs_embeds.to(self.device)
-                    if inputs_embeds is not None else None,
-                ).cpu()
+        with set_forward_context(attn_metadata, self.vllm_config):
+            hidden_states = self.model(
+                input_ids=input_ids.unsqueeze(0).to(self.device),
+                positions=positions[:num_input_tokens].unsqueeze(0).to(
+                    self.device),
+                intermediate_tensors=None,
+                inputs_embeds=inputs_embeds.to(self.device)
+                if inputs_embeds is not None else None,
+            ).cpu()
         hidden_states = hidden_states[0, :num_scheduled_tokens]
         hidden_states = hidden_states[logits_indices.cpu()]
 
@@ -862,7 +861,6 @@ class NeuronModelRunner:
             for layer_name in kv_cache_group.layer_names:
                 tensor_config = kv_cache_config.tensors[layer_name]
                 assert tensor_config.size % kv_cache_spec.page_size_bytes == 0
-                num_blocks = tensor_config.size // kv_cache_spec.page_size_bytes
                 if isinstance(kv_cache_spec, FullAttentionSpec):
                     kv_cache_shape = NeuronAttentionBackend.get_kv_cache_shape(
                         self.num_blocks + 1, self.block_size,
@@ -870,8 +868,8 @@ class NeuronModelRunner:
                     dtype = kv_cache_spec.dtype
 
                     neuron_kv_cache = torch.zeros(kv_cache_shape,
-                                               dtype=dtype,
-                                               device=self.device)
+                                                  dtype=dtype,
+                                                  device=self.device)
 
                     kv_caches[layer_name] = neuron_kv_cache
                 else:
@@ -897,7 +895,7 @@ class NeuronModelRunner:
         assert self.model is not None
         return self.model
 
-    def get_kv_cache_spec(self) -> KVCacheSpec:
+    def get_kv_cache_spec(self) -> dict[str, KVCacheSpec]:
         """
         Generates the KVCacheSpec by parsing the kv cache format from each 
         Attention module in the static forward context.
@@ -908,7 +906,7 @@ class NeuronModelRunner:
 
         forward_ctx = self.vllm_config.compilation_config.static_forward_context
         block_size = self.vllm_config.cache_config.block_size
-        kv_cache_spec: KVCacheSpec = {}
+        kv_cache_spec: dict[str, KVCacheSpec] = {}
         for layer_name, attn_module in forward_ctx.items():
             # TODO: Support other attention modules, e.g., sliding window,
             # cross-attention, MLA.
