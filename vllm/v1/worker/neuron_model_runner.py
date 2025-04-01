@@ -7,6 +7,7 @@ import numpy as np
 import torch
 import torch.distributed
 import torch.nn as nn
+import torch_xla.core.xla_model as xm
 
 from vllm.attention import AttentionType
 from vllm.attention.layer import Attention
@@ -469,8 +470,8 @@ class NeuronModelRunner:
         block_table = self.input_batch.block_table.get_cpu_tensor()[:num_reqs]
         active_block_table = get_active_block_tables(
             block_table,
-            torch.tensor(query_lens),
-            torch.tensor(seq_lens),
+            query_lens,
+            seq_lens,
             self.block_size,
             num_active_blocks,
         )
@@ -514,11 +515,10 @@ class NeuronModelRunner:
                                          block_size=self.block_size)
 
         logits_indices = query_start_loc[1:] - 1
-        query_start_loc = query_start_loc.to(self.device, non_blocking=True)
-        seq_start_loc = seq_start_loc.to(self.device, non_blocking=True)
-        slot_mapping = slot_mapping.long().to(self.device, non_blocking=True)
-        active_block_table = active_block_table.to(torch.int32).to(
-            self.device, non_blocking=True)
+        query_start_loc = query_start_loc.to(self.device)
+        seq_start_loc = seq_start_loc.to(self.device)
+        slot_mapping = slot_mapping.long().to(self.device)
+        active_block_table = active_block_table.to(torch.int32).to(self.device)
         attn_mask = attn_mask.to(self.device)
         attn_metadata = NeuronAttentionMetadata(
             num_actual_tokens=total_num_scheduled_tokens,
@@ -657,15 +657,16 @@ class NeuronModelRunner:
             positions = self.positions[:num_input_tokens]
 
         # Run the decoder.
-        with set_forward_context(attn_metadata, self.vllm_config):
-            hidden_states = self.model(
-                input_ids=input_ids.unsqueeze(0).to(self.device),
-                positions=positions[:num_input_tokens].unsqueeze(0).to(
-                    self.device),
-                intermediate_tensors=None,
-                inputs_embeds=inputs_embeds.to(self.device)
-                if inputs_embeds is not None else None,
-            ).cpu()
+        with torch.inference_mode():
+            with set_forward_context(attn_metadata, self.vllm_config):
+                hidden_states = self.model(
+                    input_ids=input_ids.unsqueeze(0).to(self.device),
+                    positions=positions[:num_input_tokens].unsqueeze(0).to(
+                        self.device),
+                    intermediate_tensors=None,
+                    inputs_embeds=inputs_embeds.to(self.device)
+                    if inputs_embeds is not None else None,
+                ).cpu()
         hidden_states = hidden_states[0, :num_scheduled_tokens]
         hidden_states = hidden_states[logits_indices.cpu()]
 
@@ -744,8 +745,10 @@ class NeuronModelRunner:
         with torch.inference_mode():
             logger.info("Starting to load model %s...",
                         self.model_config.model)
-            model = get_model(vllm_config=self.vllm_config).eval().to(
-                self.device)
+            model = get_model(vllm_config=self.vllm_config)
+            model = model.eval().to(self.device)
+            xm.mark_step()
+            xm.wait_device_ops()
             self.model = torch.compile(model,
                                        backend="openxla",
                                        fullgraph=True,
