@@ -348,7 +348,8 @@ class NeuronModelRunner:
         num_reqs = self.input_batch.num_reqs
         assert num_reqs > 0
 
-        self.input_batch.block_table.commit(num_reqs)
+        with torch.inference_mode():
+            self.input_batch.block_table.commit(num_reqs)
 
         # Get the number of scheduled tokens for each request.
         # TODO: The Python loop can be slow. Optimize.
@@ -447,10 +448,9 @@ class NeuronModelRunner:
         seq_start_loc_np[0] = 0
         np.cumsum(seq_lens, out=seq_start_loc_np[1:])
 
-        self.input_ids[:total_num_scheduled_tokens].copy_(input_ids,
-                                                          non_blocking=True)
-        self.positions[:total_num_scheduled_tokens].copy_(positions,
-                                                          non_blocking=True)
+        with torch.inference_mode():
+            self.input_ids[:total_num_scheduled_tokens].copy_(input_ids)
+            self.positions[:total_num_scheduled_tokens].copy_(positions)
 
         seq_lens = torch.diff(seq_start_loc)
         query_lens = torch.diff(query_start_loc)
@@ -611,7 +611,7 @@ class NeuronModelRunner:
                 encoder_outputs.append(encoder_output[start_idx:end_idx])
         return encoder_outputs
 
-    @torch.inference_mode()
+    @torch.no_grad()
     def execute_model(
         self,
         scheduler_output: "SchedulerOutput",
@@ -747,17 +747,12 @@ class NeuronModelRunner:
             model = get_model(vllm_config=self.vllm_config).eval().to(
                 self.device)
             self.model = torch.compile(model,
-                                       backend="openxla",
+                                       backend="eager",
                                        fullgraph=True,
                                        dynamic=False)
 
     @torch.inference_mode()
-    def _dummy_run(
-        self,
-        num_tokens: int,
-    ) -> torch.Tensor:
-        model = self.model
-
+    def _dummy_run(self, kv_caches, num_tokens: int) -> torch.Tensor:
         num_active_blocks_shifted = shift_bit_length(
             (self.block_size - 1) // self.block_size)
         num_active_blocks_factor = (LARGE_TILE_SZ // self.block_size //
@@ -813,7 +808,7 @@ class NeuronModelRunner:
             input_ids = self.input_ids[:num_tokens]
             inputs_embeds = None
         with set_forward_context(attn_metadata, self.vllm_config):
-            hidden_states = model(
+            hidden_states = self.model(
                 input_ids=input_ids.unsqueeze(0).to(self.device)
                 if input_ids is not None else None,
                 positions=self.positions[:num_tokens].unsqueeze(0).to(
@@ -825,7 +820,7 @@ class NeuronModelRunner:
 
     def profile_run(self) -> None:
         num_tokens = max(self.neuron_compilation_batch_sizes)
-        self._dummy_run(num_tokens)
+        self._dummy_run(self.kv_caches, num_tokens)
 
     def capture_model(self) -> None:
 
@@ -833,7 +828,7 @@ class NeuronModelRunner:
 
         # Trigger Neuron compilation for specific shapes
         for num_tokens in reversed(self.neuron_compilation_batch_sizes):
-            self._dummy_run(num_tokens)
+            self._dummy_run(self.kv_caches, num_tokens)
 
         end_time = time.perf_counter()
         elapsed_time = end_time - start_time

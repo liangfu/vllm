@@ -74,8 +74,7 @@ class NeuronPlatform(Platform):
 
         cache_config = vllm_config.cache_config
         if cache_config:
-            # neuron V1 only: the preferred block_size is 32
-            vllm_config.cache_config.block_size = 32
+            vllm_config.cache_config.block_size = 16
 
         model_config = vllm_config.model_config
         if model_config:
