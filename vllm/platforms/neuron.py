@@ -83,7 +83,8 @@ class NeuronPlatform(Platform):
         compilation_config = vllm_config.compilation_config
         if compilation_config:
             compilation_config.custom_ops = ["silu_and_mul"]
-            compilation_config.level = CompilationLevel.DYNAMO_AS_IS
+            compilation_config.level = CompilationLevel.DYNAMO_ONCE
+            compilation_config.backend = "openxla"
             compilation_config.cudagraph_capture_sizes = [
                 vllm_config.scheduler_config.max_num_batched_tokens
                 if vllm_config.scheduler_config else 128

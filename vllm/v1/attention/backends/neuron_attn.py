@@ -133,7 +133,6 @@ class NeuronAttentionBackendImpl(AttentionImpl[NeuronAttentionMetadata]):
         self.num_kv_heads = num_kv_heads
         self.scale = scale
 
-    @torch.inference_mode()
     def forward(
         self,
         layer: torch.nn.Module,

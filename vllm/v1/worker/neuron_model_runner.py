@@ -747,7 +747,7 @@ class NeuronModelRunner:
             model = get_model(vllm_config=self.vllm_config).eval().to(
                 self.device)
             self.model = torch.compile(model,
-                                       backend="eager",
+                                       backend="openxla",
                                        fullgraph=True,
                                        dynamic=False)
 
