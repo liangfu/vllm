@@ -74,7 +74,8 @@ class NeuronPlatform(Platform):
 
         cache_config = vllm_config.cache_config
         if cache_config:
-            vllm_config.cache_config.block_size = 16
+            cache_config.block_size = 16
+            cache_config.gpu_memory_utilization = 0.85
 
         model_config = vllm_config.model_config
         if model_config:
