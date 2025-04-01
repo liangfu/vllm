@@ -888,29 +888,35 @@ def reshape_and_cache(
             (num_tokens, n_kv_head, d_head)
         value (torch.Tensor): Value tensor with shape 
             (num_tokens, n_kv_head, d_head)
-        key_cache (torch.Tensor): Key cache tensor with shape 
-            (num_blocks, n_kv_head, block_size, d_head)
-        value_cache (torch.Tensor): Value cache tensor with shape
-            (num_blocks, n_kv_head, block_size, d_head) 
+        kv_cache (torch.Tensor): Key cache tensor with shape 
+            (2, num_blocks, n_kv_head, block_size, d_head)
         slot_mapping (torch.Tensor): Mapping tensor indicating cache positions
             with shape (num_tokens)
 
     Returns:
         None: Updates the key_cache and value_cache tensors in-place
     """
-    block_size = kv_cache.size(2)
+    block_size = kv_cache.size(3)
+    n_kv_head = key.size(1)
 
     # Calculate indices with explicit floor division
     block_indices = torch.div(slot_mapping, block_size, rounding_mode="floor")
     block_offsets = slot_mapping % block_size
 
+    # Create the head indices tensor
+    head_indices = torch.arange(n_kv_head, device=key.device)
+
     # Update caches using index_put_
     kv_cache.index_put_(
-        (torch.tensor([0], device=key.device), block_indices.unsqueeze(1),
-         torch.arange(kv_cache.size(2),
-                      device=key.device), block_offsets.unsqueeze(1)), key)
+        (torch.tensor([0], device=key.device),
+         block_indices[:, None],
+         head_indices[None, :],
+         block_offsets[:, None]
+        ), key)
 
     kv_cache.index_put_(
-        (torch.tensor([1], device=key.device), block_indices.unsqueeze(1),
-         torch.arange(kv_cache.size(2),
-                      device=value.device), block_offsets.unsqueeze(1)), value)
+        (torch.tensor([1], device=key.device),
+         block_indices[:, None],
+         head_indices[None, :],
+         block_offsets[:, None]
+        ), value)
