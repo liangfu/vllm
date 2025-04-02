@@ -488,12 +488,10 @@ def build_attention_mask(
     seq_lens_sbuf = nl.load(seq_lens[i_f])
     print(f"{cu_query_lens_sbuf.shape=}, {max_num_queries=}, {max_num_keys=}, {max_num_seqs=}, {block_size=}")
     query_lens = cu_query_lens_sbuf[i_p, i_f+1] - cu_query_lens_sbuf[i_p, i_f]
-    ctx_lens = seq_lens_sbuf - query_lens
-    q_cumsum = cu_query_lens_sbuf
-    k_cumsum = cu_ctx_lens_sbuf
+    ctx_lens = seq_lens_sbuf
     
-    assert (int(q_cumsum.shape[1]) == max_num_seqs+1) and (int(q_cumsum.ndim) == 2), f"invalid {cu_query_lens=}"
-    assert (int(k_cumsum.shape[1]) == max_num_seqs+1) and (int(k_cumsum.ndim) == 2), f"invalid {cu_ctx_lens=}"
+    assert (int(cu_query_lens_sbuf.shape[1]) == max_num_seqs+1) and (int(cu_query_lens_sbuf.ndim) == 2), f"invalid {cu_query_lens=}"
+    assert (int(cu_ctx_lens_sbuf.shape[1]) == max_num_seqs+1) and (int(cu_ctx_lens_sbuf.ndim) == 2), f"invalid {cu_ctx_lens=}"
     assert (int(query_lens.shape[1]) == max_num_seqs) and (int(query_lens.ndim) == 2), f"invalid {query_lens=}"
     assert (int(seq_lens_sbuf.shape[1]) == max_num_seqs) and (int(seq_lens_sbuf.ndim) == 2), f"invalid {seq_lens=}"
 
@@ -536,8 +534,8 @@ def build_attention_mask(
 
     # Process each sequence
     for seq_idx in nl.sequential_range(max_num_seqs):
-        ri = _br(q_cumsum[0, seq_idx])
-        ci = _br(k_cumsum[0, seq_idx])
+        ri = _br(cu_query_lens_sbuf[0, seq_idx])
+        ci = _br(cu_ctx_lens_sbuf[0, seq_idx])
         nr = _br(query_lens[0, seq_idx])
         nc = _br(ctx_lens[0, seq_idx])
         print(f"{ci.shape=}, {nc.shape=}, {ri.shape=}, {nr.shape=}")
