@@ -259,13 +259,13 @@ def sample_inputs(
                              value[start_loc:end_loc])
             cur_ctx += block_size
             block_id += 1
+    kv_cache = torch.stack([k_cache, v_cache])
 
     return (
         query,
         k,
         v,
-        k_cache,
-        v_cache,
+        kv_cache,
         block_table,
         key,
         value,
@@ -301,7 +301,7 @@ def get_active_block_tables(block_tables, query_lens, seq_lens, block_size,
         # (1, 199, 1, 512, 4, 2, 8, True),  # same with mixed precision
 
         # Test common/medium configurations
-        (1, 3, 4, 128, 4, 2, 4, True),  # common case, larger heads
+        (1, 3, 4, 512, 4, 2, 4, True),  # common case, larger heads
         # (4, 12, 32, 2048, 16, 4, 32,
         #  True),  # medium size, mixed precision, grouped-query attention (GQA)
 
@@ -360,8 +360,7 @@ def test_contexted_kv_attention(
         query,
         k_active,
         v_active,
-        k_cache,
-        v_cache,
+        kv_cache,
         block_table,
         key,
         value,
@@ -414,6 +413,8 @@ def test_contexted_kv_attention(
     num_active_blocks = pad_to_multiple(num_active_blocks,
                                         large_tile_size // block_size)
     context_kv_len = num_active_blocks * block_size
+    import pdb
+    pdb.set_trace()
     assert (context_kv_len %
             large_tile_size == 0), f"invalid context_kv_len={context_kv_len}"
 
@@ -437,8 +438,7 @@ def test_contexted_kv_attention(
     query = query.unsqueeze(0).permute(0, 2, 3, 1).contiguous()
     k = k.unsqueeze(0).permute(0, 2, 3, 1).contiguous()
     v = v.unsqueeze(0).permute(0, 2, 1, 3).contiguous()
-    k_cache = k_cache.permute(0, 2, 1, 3).contiguous()
-    v_cache = v_cache.permute(0, 2, 1, 3).contiguous()
+    kv_cache = kv_cache.permute(0, 1, 3, 2, 4).contiguous()
 
     # transform block table
     active_block_table = get_active_block_tables(
@@ -483,6 +483,7 @@ def test_contexted_kv_attention(
     seqused_k = torch.tensor(context_lens, dtype=torch.int32)
     max_seqlen_q = max_num_queries
     max_seqlen_k = context_kv_len
+    max_num_seqs = len(query_lens)
 
     # TODO(liangfu): remove cu_seq_lens for sequence-aligned implementation
     cu_seq_lens = torch.tensor([0] + seq_lens, dtype=torch.int32).cumsum(dim=0, dtype=torch.int32)
@@ -491,8 +492,7 @@ def test_contexted_kv_attention(
         query.to(device=device),
         k.to(device=device),
         v.to(device=device),
-        k_cache.to(device=device),
-        v_cache.to(device=device),
+        kv_cache.to(device=device),
     )
     input_kwargs = dict(
         # n_kv_head=num_kv_heads,
@@ -508,6 +508,7 @@ def test_contexted_kv_attention(
 
         # TODO: remove
         attn_mask=attn_mask.to(device=device),
+        LARGE_TILE_SZ=large_tile_size
     )
 
     output_nki = flash_attn_varlen_func(*input_args, **input_kwargs)

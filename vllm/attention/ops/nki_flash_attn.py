@@ -585,6 +585,13 @@ def flash_paged_attention(
     key,
     value,
     kv_cache,
+
+    cu_seqlens_q,
+    cu_seqlens_k,
+    seqused_k,
+    max_seqlen_q,
+    max_seqlen_k,
+
     block_tables,
     mask,
     softmax_scale=None,
@@ -771,7 +778,9 @@ def flash_paged_attention(
     )
 
     prior_mask, *debug_tensors = build_attention_mask(
-        cu_query_lens, cu_ctx_lens_blockaligned, ctx_lens, max_query_lens, max_seq_lens, max_num_seqs, block_size)
+        cu_seqlens_q, cu_seqlens_k, seqused_k, max_seqlen_q, max_seqlen_k, max_num_seqs=max_seqlen_q, block_size=block_size)
+    # cu_query_lens, cu_ctx_lens_blockaligned, ctx_lens, max_query_lens, max_seq_lens, max_num_seqs, block_size)
+    # cu_query_lens, cu_query_lens, query_lens, max_query_lens, max_query_lens, max_num_seqs, block_size, contexted=True)
 
     for large_k_tile_idx in nl.sequential_range(0, num_large_k_tile):
         num_loads = ceil_div(num_blocks_per_large_tile, B_P_SIZE)
@@ -830,7 +839,8 @@ def flash_paged_attention(
                 )
 
     active_mask, *debug_tensors = build_attention_mask(
-        cu_query_lens, cu_ctx_lens, query_lens, max_query_lens, max_query_lens, max_num_seqs, block_size, contexted=True)
+        cu_seqlens_q, cu_seqlens_q, seqused_q, max_seqlen_q, max_seqlen_q, max_num_seqs=max_seqlen_q, block_size=block_size)
+    # cu_query_lens, cu_query_lens, query_lens, max_query_lens, max_query_lens, max_num_seqs, block_size, contexted=True)
 
     # compute attention between input query, key and value
     if key is not None and value is not None:
@@ -989,7 +999,15 @@ def flash_attn_varlen_func(
     key,
     value,
     kv_cache,
+
+    cu_seqlens_q,
+    cu_seqlens_k,
+    seqused_k,
+    max_seqlen_q,
+    max_seqlen_k,
+
     block_table,
+
     attn_mask,
     n_kv_head=None,
     head_size=None,
@@ -1025,6 +1043,13 @@ def flash_attn_varlen_func(
         key=key,
         value=value,
         kv_cache=kv_cache,
+
+        cu_seqlens_q=cu_seqlens_q,
+        cu_seqlens_k=cu_seqlens_k,
+        seqused_k=seqused_k,
+        max_seqlen_q=max_seqlen_q,
+        max_seqlen_k=max_seqlen_k,
+
         block_tables=block_table,
         mask=attn_mask,
         softmax_scale=1.0 / (head_size**0.5),
