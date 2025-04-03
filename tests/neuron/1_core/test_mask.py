@@ -64,10 +64,9 @@ def test_context_mask(
     np.testing.assert_allclose(expected[0], prior_mask)
 
     # active mask
-    cu_ctx_lens = np.array([0] + query_lens, dtype=np.int32).cumsum(axis=0, dtype=np.int32)
     query_lens = np.array(query_lens, dtype=np.int32)
     active_mask, *debug_tensors = build_attention_mask(
-        cu_query_lens, cu_ctx_lens, query_lens, max_query_lens, max_seq_lens, max_num_seqs, block_size, contexted=True)
+        cu_query_lens, cu_query_lens, query_lens, max_query_lens, max_query_lens, max_num_seqs, block_size, contexted=True)
     active_mask = active_mask.astype(bool).astype(np.int32)
     loop_var = debug_tensors[-1]
     np.testing.assert_allclose(expected[1], active_mask)

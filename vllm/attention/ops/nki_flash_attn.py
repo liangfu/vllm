@@ -497,7 +497,6 @@ def build_attention_mask(
 
     # Create mask buffers
     prior_mask = nl.ndarray((1, max_num_queries, max_num_keys), dtype=nl.bool_, buffer=nl.shared_hbm)
-    active_mask = nl.ndarray((1, max_num_queries, max_num_queries), dtype=nl.bool_, buffer=nl.shared_hbm)
 
     q_tile_size, k_tile_size = max_num_queries, 8
     n_q_tile = (max_num_queries + q_tile_size - 1) // q_tile_size
@@ -771,6 +770,9 @@ def flash_paged_attention(
         lazy_initialization=True,
     )
 
+    prior_mask, *debug_tensors = build_attention_mask(
+        cu_query_lens, cu_ctx_lens_blockaligned, ctx_lens, max_query_lens, max_seq_lens, max_num_seqs, block_size)
+
     for large_k_tile_idx in nl.sequential_range(0, num_large_k_tile):
         num_loads = ceil_div(num_blocks_per_large_tile, B_P_SIZE)
         cur_k_tile = nl.ndarray(
@@ -826,6 +828,9 @@ def flash_paged_attention(
                     B_F_SIZE=B_F_SIZE,
                     B_D_SIZE=B_D_SIZE,
                 )
+
+    active_mask, *debug_tensors = build_attention_mask(
+        cu_query_lens, cu_ctx_lens, query_lens, max_query_lens, max_query_lens, max_num_seqs, block_size, contexted=True)
 
     # compute attention between input query, key and value
     if key is not None and value is not None:
@@ -979,7 +984,7 @@ def reorder_context_mask(mask, LARGE_TILE_SZ, block_size):
         return mask
 
 
-def flash_attn_varlen_nkifunc(
+def flash_attn_varlen_func(
     query,
     key,
     value,
