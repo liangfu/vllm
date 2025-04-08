@@ -20,21 +20,18 @@ def neuron_paged_attn(
     block_table: torch.Tensor,
     attn_mask: torch.Tensor,
 ) -> torch.Tensor:
-    from vllm.attention.ops.nki_flash_attn import flash_attn_varlen_nkifunc
-    _, n_kv_head, _, head_size = key_cache.shape
-    output_nki = flash_attn_varlen_nkifunc(
-        query=query,
-        key=key,
-        value=value,
-        key_cache=key_cache,
-        value_cache=value_cache,
+    output = flash_attn_varlen_func(
+        q=query,
+        k=key,
+        v=value,
+        k_cache=key_cache,
+        v_cache=value_cache,
+
+        # TODO: deprecate block_table and attn_mask argument
         block_table=block_table,
         attn_mask=attn_mask,
-        n_kv_head=n_kv_head,
-        head_size=head_size,
-        mixed_precision=True,
     )
-    return output_nki
+    return output
 
 
 @neuron_paged_attn.register_fake

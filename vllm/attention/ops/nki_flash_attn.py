@@ -144,8 +144,7 @@ def transform_block_tables_for_indirect_load(
 def load_kv_tile_from_cache(
     cur_k_tile,
     cur_v_tile,
-    key_cache,
-    value_cache,
+    kv_cache,
     block_tables,
     large_k_tile_idx,
     num_blocks_per_large_tile,
@@ -169,8 +168,8 @@ def load_kv_tile_from_cache(
     for load_idx in nl.affine_range(num_loads):
         i_p = nl.arange(B_P_SIZE)[:, None]
         i_f = nl.arange(tiled_block_size * B_D_SIZE)[None, :]
-        loaded = nl.load(key_cache[block_tables[load_idx, i_p,
-                                                large_k_tile_idx], i_f])
+        loaded = nl.load(kv_cache[0, block_tables[load_idx, i_p,
+                                                  large_k_tile_idx], i_f])
         if cur_k_tile.dtype != loaded.dtype:
             loaded = nl.copy(loaded, dtype=cur_k_tile.dtype)
         # Transpose SBUF tensor using PE
@@ -185,7 +184,7 @@ def load_kv_tile_from_cache(
 
     # load value cache
     for load_idx in nl.affine_range(num_loads):
-        loaded = nl.load(value_cache[block_tables[load_idx, i_p,
+        loaded = nl.load(kv_cache[1, block_tables[load_idx, i_p,
                                                   large_k_tile_idx], i_f])
         if cur_v_tile.dtype != loaded.dtype:
             loaded = nl.copy(loaded, dtype=cur_v_tile.dtype)
@@ -414,12 +413,202 @@ def load_v_tile(v_hbm_tile, cur_v_tile, large_tile_idx, v_i, LARGE_TILE_SZ):
 
 
 @nki.jit
+def build_attention_mask(
+    prior_mask,
+    cu_query_lens,
+    cu_ctx_lens,
+    seq_lens,
+    max_num_queries,
+    max_num_keys,
+    max_num_seqs,
+    block_size,
+    contexted=False,
+):
+    """
+    Creates block diagonal causal masks for multiple prompts.
+
+    This mask is dynamic and depends on the input prompt lengths.
+
+    Example:
+        query_lens = [2, 3, 1, 0], key_lens = [4, 5, 4, 0], max_num_queries = 8, max_num_keys = 16, max_num_seqs = 4
+
+        prior_mask = [
+        #   i0, 1, 2, 3, 4, 5, 6, 7, 8, 9,10,11,12,13,14,15,16,17,18,19
+        #   c0,c0,c0,n0,c1,c1,c1,n1,n1,p1,p1,p1,c2,c2,c2,c2,p3,p3,p3,p3 - (c - cached token, n - new token, p - padding)
+            [1, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], # sequence 0 (4 tokens, aligned to 1 block)
+            [1, 1, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], # sequence 0 (4 tokens, aligned to 1 block)
+            [0, 0, 0, 0, 1, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], # sequence 1 (5 tokens, aligned to 2 blocks)
+            [0, 0, 0, 0, 1, 1, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], # sequence 1 (5 tokens, aligned to 2 blocks)
+            [0, 0, 0, 0, 1, 1, 1, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], # sequence 1 (5 tokens, aligned to 2 blocks)
+            [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 0, 0, 0, 0], # sequence 2 (4 tokens, aligned to 1 block)
+            [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], # padding
+            [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], # padding
+        ]
+        active_mask = None
+
+    Args:
+        prompt_lens: The list of prompt lengths.
+        n_positions: The total size of the KV cache to consider. This is
+            equal to the current bucket size.
+
+    Returns:
+        prior_mask: The attention mask to apply to the KV cache.
+        active_mask: The attention mask to apply to the active tokens (None).
+
+    For each sequence, we start from building a triangle mask with an offset.
+    As shown in the following figure, with
+
+      ri = q_cumsum[seq_id]
+      ci = k_cumsum[seq_id] (k_cumsum need to be block-aligned)
+      nr = query_lens[seq_id]
+      nc = key_lens[seq_id]
+
+    we can trim the triangle mask from different directions, in order to get the desired shape.
+
+                 (0, ci+nc-ri-nr)
+    +--------------------+----------------------------------+
+    |                      \                                |
+    |                        \   (ri, ci+nc-nr)             |
+    |                          \   |                        |
+    |   (ri, ci)                 \       (ri, ci+nc)        |
+    |       +----------------------+ - - - +                |
+    |       | xxxxxxxxxxxxxxxxxxxxxx \     |                |
+    |       | xxxxxxxxxxxxxxxxxxxxxxxx \   |                |
+    |       | xxxxxxxxxxxxxxxxxxxxxxxxxx \ |                |
+    |       +------------------------------+                |
+    |   (ri+nr, ci)                      (ri+nr, ci+nc)     |
+    |                                                       |
+    +-------------------------------------------------------+
+    """
+
+    print(f"{cu_query_lens.shape=}")
+    i_p = nl.arange(1)[:, None]
+    cu_f = nl.arange(max_num_seqs + 1)[None, :]
+    i_f = nl.arange(max_num_seqs)[None, :]
+    cu_query_lens_sbuf = nl.load(cu_query_lens[cu_f])
+    cu_ctx_lens_sbuf = nl.load(cu_ctx_lens[cu_f])
+    seq_lens_sbuf = seq_lens
+    print(
+        f"{cu_query_lens_sbuf.shape=}, {max_num_queries=}, {max_num_keys=}, {max_num_seqs=}, {block_size=}"
+    )
+    query_lens = cu_query_lens_sbuf[i_p, i_f + 1] - cu_query_lens_sbuf[i_p,
+                                                                       i_f]
+    ctx_lens = seq_lens_sbuf
+
+    assert (int(cu_query_lens_sbuf.shape[1]) == max_num_seqs + 1) and (int(
+        cu_query_lens_sbuf.ndim) == 2), f"invalid {cu_query_lens=}"
+    assert (int(cu_ctx_lens_sbuf.shape[1]) == max_num_seqs + 1) and (int(
+        cu_ctx_lens_sbuf.ndim) == 2), f"invalid {cu_ctx_lens=}"
+    assert (int(query_lens.shape[1]) == max_num_seqs) and (int(
+        query_lens.ndim) == 2), f"invalid {query_lens=}"
+    assert (int(seq_lens_sbuf.shape[1]) == max_num_seqs) and (int(
+        seq_lens_sbuf.ndim) == 2), f"invalid {seq_lens=}"
+
+    # Create mask buffers
+    # prior_mask = nl.ndarray((1, max_num_queries, max_num_keys), dtype=nl.bool_, buffer=nl.shared_hbm)
+
+    q_tile_size, k_tile_size = max_num_queries, max_num_keys  # max_num_queries, 8
+    n_q_tile = (max_num_queries + q_tile_size - 1) // q_tile_size
+    n_k_tile = (max_num_keys + k_tile_size - 1) // k_tile_size
+    print(f"{n_q_tile=}, {n_k_tile=}")
+    i_p = nl.arange(q_tile_size)[:, None]  # this works for dynamic access
+    i_f = nl.arange(k_tile_size)[None, :]
+
+    def _br(x):
+        return x.broadcast_to((
+            q_tile_size,
+            k_tile_size,
+        ))
+
+    # expr_a = nl.arange(0, k_tile_size)[None, :]
+    expr_a = nl.arange(0, q_tile_size)[:, None]
+    a_tile = nisa.iota(expr_a, dtype=nl.int32)
+    a = _br(a_tile)
+    # expr_b = nl.arange(0, q_tile_size)[:, None]
+    expr_b = nl.arange(0, k_tile_size)[None, :]
+    b_tile = nisa.iota(expr_b, dtype=nl.int32)
+    b = _br(b_tile)
+    print(f"{a.shape=}, {b.shape=}, {a_tile.shape=}, {b_tile.shape=}")
+
+    # iota_hbm = nl.ndarray((2, q_tile_size, k_tile_size), dtype=nl.int32, buffer=nl.shared_hbm)
+    # new_mask_hbm = nl.ndarray((max_num_seqs, n_k_tile, q_tile_size, k_tile_size), dtype=nl.int32, buffer=nl.shared_hbm)
+    # loop_var = nl.ndarray((max_num_seqs, n_k_tile, 10), dtype=nl.int32, buffer=nl.shared_hbm)
+
+    # initialize with zero
+    for k_tile_idx in nl.sequential_range(n_k_tile):
+        q_tile_idx = 0
+        q_slice = nl.ds(q_tile_idx * q_tile_size, q_tile_size)
+        k_slice = nl.ds(k_tile_idx * k_tile_size, k_tile_size)
+        q_bound = (q_tile_idx * q_tile_size + i_p) < max_num_queries
+        k_bound = (k_tile_idx * k_tile_size + i_f) < max_num_keys
+        nl.store(prior_mask[0, q_slice, k_slice],
+                 value=0,
+                 mask=q_bound & k_bound)
+
+    # Process each sequence
+    for seq_idx in nl.sequential_range(max_num_seqs):
+        ri = _br(cu_query_lens_sbuf[0, seq_idx])
+        ci = _br(cu_ctx_lens_sbuf[0, seq_idx])
+        nr = _br(query_lens[0, seq_idx])
+        nc = _br(ctx_lens[0, seq_idx])
+        print(f"{ci.shape=}, {nc.shape=}, {ri.shape=}, {nr.shape=}")
+
+        for k_tile_idx in nl.sequential_range(n_k_tile):
+            q_tile_idx = 0
+            tile_offset = _br(b_tile[0, k_tile_idx] * k_tile_size)
+
+            if contexted:
+                a_offset = (ci + nc) - (ri + nr)
+                new_mask = nl.greater_equal(a + a_offset - tile_offset, b)
+            else:
+                a_offset = ci + nc
+                new_mask = nl.greater_equal(ci + nc - 1 - tile_offset, b)
+
+            # nl.store(new_mask_hbm[seq_idx, k_tile_idx, :, :], new_mask)
+
+            left_mask = b >= (ci - tile_offset)
+            top_mask = a >= ri
+            bottom_mask = nl.less(a, ri + nr)
+            new_mask = new_mask & left_mask & top_mask & bottom_mask
+
+            q_slice = nl.ds(q_tile_idx * q_tile_size, q_tile_size)
+            k_slice = nl.ds(k_tile_idx * k_tile_size, k_tile_size)
+            q_bound = (q_tile_idx * q_tile_size + i_p) < max_num_queries
+            k_bound = (k_tile_idx * k_tile_size + i_f) < max_num_keys
+
+            new_mask = nl.load(prior_mask[0, q_slice, k_slice],
+                               mask=q_bound & k_bound) | new_mask[i_p, i_f]
+            nl.store(prior_mask[0, q_slice, k_slice],
+                     new_mask[i_p, i_f],
+                     mask=q_bound & k_bound)
+
+        # nl.store(loop_var[seq_idx, k_tile_idx, 0], ri[0, 0])
+        # nl.store(loop_var[seq_idx, k_tile_idx, 1], ci[0, 0])
+        # nl.store(loop_var[seq_idx, k_tile_idx, 2], nr[0, 0])
+        # nl.store(loop_var[seq_idx, k_tile_idx, 3], nc[0, 0])
+        # nl.store(loop_var[seq_idx, k_tile_idx, 4], tile_offset[0, 0])
+        # nl.store(loop_var[seq_idx, k_tile_idx, 5], a_offset[0, 0])
+
+    # nl.store(iota_hbm[0, :, :], a)
+    # nl.store(iota_hbm[1, :, :], b)
+
+    # return prior_mask, iota_hbm, new_mask_hbm, loop_var
+    return prior_mask
+
+
+
+
+@nki.jit
 def flash_paged_attention(
     query,
     key,
     value,
-    key_cache,
-    value_cache,
+    kv_cache,
+    cu_seqlens_q,
+    cu_seqlens_k,
+    seqused_k,
+    max_seqlen_q,
+    max_seqlen_k,
     block_tables,
     mask,
     softmax_scale=None,
@@ -434,8 +623,7 @@ def flash_paged_attention(
       - query: shape   (1, n_heads, d, seq_q)
       - key:   shape   (1, n_kv_heads, d, seq_k)
       - value: shape   (1, n_kv_heads, seq_v, d)
-      - key_cache: (num_blocks, n_kv_heads, block_size, d)
-      - value_cache: (num_blocks, n_kv_heads, block_size, d)
+      - kv_cache: (2, num_blocks, n_kv_heads, block_size, d)
       - block_tables: (num_active_blocks, )
       - mask: (seq_q, num_active_blocks * block_size + seq_q)
       - o: shape (1, n_heads, seq_q, d)
@@ -444,7 +632,7 @@ def flash_paged_attention(
       - We use continuous batching by default, so the batch dimension is
         always 1, and different requests are concatenated along sequence
         dimension.
-      - We use paged cache blocks (key_cache, value_cache) to store KV cache.
+      - We use paged cache blocks (kv_cache) to store KV cache.
 
     IO tensor dtypes:
       - This kernel assumes all IO tensors have the same dtype except for
@@ -475,15 +663,14 @@ def flash_paged_attention(
     b, h, d, seqlen_q = query.shape
     B_D_SIZE = d
     n_tile_q = seqlen_q // B_P_SIZE  # since q will be loaded on tensor engine
-    num_blocks, k_h, block_size, _ = key_cache.shape
+    assert n_tile_q >= 1, f"at least 1 query-tile is required: {seqlen_q} vs {B_P_SIZE}"
+    _, num_blocks, k_h, block_size, _ = kv_cache.shape
     q_h_per_k_h = h // k_h
     assert b == 1, f"invalid batch size {b=}"
     assert d <= 128, f" we do not support head_dim > 128, got head dim {d=}"
-    cache_shape = (num_blocks, k_h, block_size, d)
-    assert (tuple(key_cache.shape) == cache_shape
-            ), f"{key_cache.shape=} mismatch, expect {cache_shape}"
-    assert (tuple(value_cache.shape) == cache_shape
-            ), f"{value_cache.shape=} mismatch, expect {cache_shape}"
+    cache_shape = (2, num_blocks, k_h, block_size, d)
+    assert (tuple(kv_cache.shape) == cache_shape
+            ), f"{kv_cache.shape=} mismatch, expect {cache_shape}"
     assert key is None or tuple(key.shape) == (
         1,
         k_h,
@@ -582,11 +769,11 @@ def flash_paged_attention(
 
     # Flatten KV cache to be 2D for loading into SBUF
     new_cache_shape = (
+        2,
         num_blocks * k_h * block_size_tiling_factor,
         tiled_block_size * d,
     )
-    key_cache = key_cache.reshape(new_cache_shape)
-    value_cache = value_cache.reshape(new_cache_shape)
+    kv_cache = kv_cache.reshape(new_cache_shape)
 
     # Global Flash Attention accumulators
     o_buffer = nl.zeros(
@@ -608,6 +795,29 @@ def flash_paged_attention(
         lazy_initialization=True,
     )
 
+    max_num_seqs = cu_seqlens_q.shape[0] - 1
+
+    prior_mask = nl.ndarray((1, max_seqlen_q, max_seqlen_k),
+                            dtype=nl.bool_,
+                            buffer=nl.private_hbm)
+    active_mask = nl.ndarray((1, max_seqlen_q, max_seqlen_q),
+                             dtype=nl.bool_,
+                             buffer=nl.private_hbm)
+
+    i_p = nl.arange(1)[:, None]
+    i_f = nl.arange(max_num_seqs)[None, :]
+    seqused_k_sbuf = nl.load(seqused_k[i_f])
+    build_attention_mask(prior_mask,
+                         cu_seqlens_q,
+                         cu_seqlens_k,
+                         seqused_k_sbuf,
+                         max_seqlen_q,
+                         max_seqlen_k,
+                         max_num_seqs=max_num_seqs,
+                         block_size=block_size)
+    # cu_query_lens, cu_ctx_lens_blockaligned, ctx_lens, max_query_lens, max_seq_lens, max_num_seqs, block_size)
+    # cu_query_lens, cu_query_lens, query_lens, max_query_lens, max_query_lens, max_num_seqs, block_size, contexted=True)
+
     for large_k_tile_idx in nl.sequential_range(0, num_large_k_tile):
         num_loads = ceil_div(num_blocks_per_large_tile, B_P_SIZE)
         cur_k_tile = nl.ndarray(
@@ -621,8 +831,7 @@ def flash_paged_attention(
         load_kv_tile_from_cache(
             cur_k_tile=cur_k_tile,
             cur_v_tile=cur_v_tile,
-            key_cache=key_cache,
-            value_cache=value_cache,
+            kv_cache=kv_cache,
             block_tables=block_tables_sbuf,
             large_k_tile_idx=large_k_tile_idx,
             num_blocks_per_large_tile=num_blocks_per_large_tile,
@@ -664,6 +873,22 @@ def flash_paged_attention(
                     B_F_SIZE=B_F_SIZE,
                     B_D_SIZE=B_D_SIZE,
                 )
+
+    i_p = nl.arange(1)[:, None]
+    cu_f = nl.arange(max_num_seqs + 1)[None, :]
+    i_f = nl.arange(max_num_seqs)[None, :]
+    cu_seqlens_q_sbuf = nl.load(cu_seqlens_q[cu_f])
+    seqused_q = cu_seqlens_q_sbuf[i_p, i_f + 1] - cu_seqlens_q_sbuf[i_p, i_f]
+    build_attention_mask(active_mask,
+                         cu_seqlens_q,
+                         cu_seqlens_q,
+                         seqused_q,
+                         max_seqlen_q,
+                         max_seqlen_q,
+                         max_num_seqs=max_num_seqs,
+                         block_size=block_size,
+                         contexted=True)
+    # cu_query_lens, cu_query_lens, query_lens, max_query_lens, max_query_lens, max_num_seqs, block_size, contexted=True)
 
     # compute attention between input query, key and value
     if key is not None and value is not None:
@@ -817,12 +1042,16 @@ def reorder_context_mask(mask, LARGE_TILE_SZ, block_size):
         return mask
 
 
-def flash_attn_varlen_nkifunc(
+def flash_attn_varlen_func(
     query,
     key,
     value,
-    key_cache,
-    value_cache,
+    kv_cache,
+    cu_seqlens_q,
+    cu_seqlens_k,
+    seqused_k,
+    max_seqlen_q,
+    max_seqlen_k,
     block_table,
     attn_mask,
     n_kv_head=None,
@@ -838,8 +1067,7 @@ def flash_attn_varlen_nkifunc(
       - query: (1, n_heads, d, seq_q)
       - key:   (1, n_kv_heads, d, seq_k)
       - value: (1, n_kv_heads, seq_v, d)
-      - key_cache:   (n_blocks, n_kv_heads, block_size, d)
-      - value_cache: (n_blocks, n_kv_heads, block_size, d)
+      - kv_cache:   (2, n_blocks, n_kv_heads, block_size, d)
       - block_tables: (n_active_blocks, )
       - attn_mask: (seq_q, n_active_blocks * block_size + seq_q)
 
@@ -849,17 +1077,22 @@ def flash_attn_varlen_nkifunc(
         for better DMA throughput
     """
     if n_kv_head is None:
-        n_kv_head = key_cache.shape[1]
-    assert key_cache.shape[1] == n_kv_head
+        n_kv_head = kv_cache.shape[2]
+    assert kv_cache.shape[0] == 2
+    assert kv_cache.shape[2] == n_kv_head
     if head_size is None:
-        head_size = key_cache.shape[-1]
+        head_size = kv_cache.shape[-1]
 
     kwargs = dict(
         query=query,
         key=key,
         value=value,
-        key_cache=key_cache,
-        value_cache=value_cache,
+        kv_cache=kv_cache,
+        cu_seqlens_q=cu_seqlens_q,
+        cu_seqlens_k=cu_seqlens_k,
+        seqused_k=seqused_k,
+        max_seqlen_q=max_seqlen_q,
+        max_seqlen_k=max_seqlen_k,
         block_tables=block_table,
         mask=attn_mask,
         softmax_scale=1.0 / (head_size**0.5),
@@ -874,8 +1107,7 @@ def flash_attn_varlen_nkifunc(
 def reshape_and_cache(
     key: torch.Tensor,
     value: torch.Tensor,
-    key_cache: torch.Tensor,
-    value_cache: torch.Tensor,
+    kv_cache: torch.Tensor,
     slot_mapping: torch.Tensor,
 ) -> None:
     """
@@ -886,29 +1118,29 @@ def reshape_and_cache(
             (num_tokens, n_kv_head, d_head)
         value (torch.Tensor): Value tensor with shape 
             (num_tokens, n_kv_head, d_head)
-        key_cache (torch.Tensor): Key cache tensor with shape 
-            (num_blocks, n_kv_head, block_size, d_head)
-        value_cache (torch.Tensor): Value cache tensor with shape
-            (num_blocks, n_kv_head, block_size, d_head) 
+        kv_cache (torch.Tensor): Key/value cache tensor with shape 
+            (2, num_blocks, n_kv_head, block_size, d_head)
         slot_mapping (torch.Tensor): Mapping tensor indicating cache positions
             with shape (num_tokens)
 
     Returns:
-        None: Updates the key_cache and value_cache tensors in-place
+        None: Updates the kv_cache tensor in-place
     """
-    block_size = key_cache.size(2)
+    block_size = kv_cache.size(3)
+    n_kv_head = key.size(1)
 
     # Calculate indices with explicit floor division
     block_indices = torch.div(slot_mapping, block_size, rounding_mode="floor")
     block_offsets = slot_mapping % block_size
 
-    # Update caches using index_put_
-    key_cache.index_put_(
-        (block_indices.unsqueeze(1),
-         torch.arange(key_cache.size(1),
-                      device=key.device), block_offsets.unsqueeze(1)), key)
+    # Create the head indices tensor
+    head_indices = torch.arange(n_kv_head, device=key.device)
 
-    value_cache.index_put_(
-        (block_indices.unsqueeze(1),
-         torch.arange(value_cache.size(1),
-                      device=value.device), block_offsets.unsqueeze(1)), value)
+    # Update caches using index_put_
+    kv_cache.index_put_(
+        (torch.tensor([0], device=key.device), block_indices[:, None],
+         head_indices[None, :], block_offsets[:, None]), key)
+
+    kv_cache.index_put_(
+        (torch.tensor([1], device=key.device), block_indices[:, None],
+         head_indices[None, :], block_offsets[:, None]), value)

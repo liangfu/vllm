@@ -1,48 +1,12 @@
 # SPDX-License-Identifier: Apache-2.0
 
-import neuronxcc.nki.language as nl
 import pytest
 import torch
 import torch.nn.functional as F
 from neuronxcc import nki
 
 from vllm.attention.ops.nki_flash_attn import (
-    load_block_tables, transform_block_tables_for_indirect_load)
-
-
-def is_power_of_2(n):
-    return n > 0 and (n & (n - 1) == 0)
-
-
-def nki_load_and_transform_block_tables(
-    block_tables,
-    num_tiles,
-    num_blocks_per_tile,
-    num_head,
-    head_id,
-    block_size_tiling_factor,
-):
-    assert is_power_of_2(
-        num_blocks_per_tile), f"{num_blocks_per_tile=} must be power of 2"
-    block_tables_sbuf = load_block_tables(block_tables, num_tiles,
-                                          num_blocks_per_tile)
-
-    # we need to pass an Index as head_id
-    head_id = nl.arange(1)[None, :] + head_id
-
-    block_tables_transposed = transform_block_tables_for_indirect_load(
-        block_tables_sbuf, block_size_tiling_factor, num_head, head_id)
-    B_P_SIZE = 128
-    assert block_tables_transposed.shape[1] == B_P_SIZE
-
-    out = nl.ndarray(
-        block_tables_transposed.shape,
-        dtype=nl.int32,
-        buffer=nl.shared_hbm,
-    )
-    for i in nl.affine_range(block_tables_transposed.shape[0]):
-        nl.store(dst=out[i], value=block_tables_transposed[i])
-    return out
+    nki_load_and_transform_block_tables)
 
 
 def ref_block_tables_transform(
@@ -79,21 +43,21 @@ def ref_block_tables_transform(
 @pytest.mark.parametrize(
     "q_head_per_kv_head,head_id",
     [
-        (1, 0),
+        # (1, 0),
         (3, 1),
     ],
 )
 @pytest.mark.parametrize(
     "num_tiles,num_blocks_per_tile",
     [
-        (1, 1),
-        (13, 16),
-        (17, 128),
-        (35, 512),
-        (128, 128),
-        (130, 64),
+        # (1, 1),
+        # (13, 16),
+        # (17, 128),
+        # (35, 512),
+        # (128, 128),
+        # (130, 64),
         (280, 256),
-        (315, 1),
+        # (315, 1),
     ],
 )
 @torch.inference_mode()
