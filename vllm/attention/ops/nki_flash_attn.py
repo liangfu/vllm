@@ -595,7 +595,25 @@ def build_attention_mask(
     # return prior_mask, iota_hbm, new_mask_hbm, loop_var
     return prior_mask
 
-
+@nki.jit
+def transpose_kv_token_mask(mask, tiled_block_size):
+    size_q, size_kv = mask.shape
+    assert size_kv % tiled_block_size == 0
+    num_block = size_kv // tiled_block_size
+    B_P_SIZE = 128
+    assert num_block >= B_P_SIZE
+    num_batch = num_block // B_P_SIZE
+    i_f1 = nl.arange(num_batch)[None, :, None, None]
+    i_f2 = nl.arange(B_P_SIZE)[None, None, :, None]
+    i_f3 = nl.arange(tiled_block_size)[None, None, None, :]
+    new_mask = nl.ndarray((size_q, size_kv), dtype=mask.dtype)
+    # transpose f2 and f3
+    transpose_range = B_P_SIZE * tiled_block_size
+    i_f_src = i_f1 * transpose_range + i_f2 * tiled_block_size + i_f3
+    i_f_dst = i_f1 * transpose_range + i_f3 * B_P_SIZE + i_f2
+    i_p = nl.arange(size_q)[:, None, None, None]
+    new_mask[i_p, i_f_dst] = nl.copy(mask[i_p, i_f_src])
+    return new_mask
 
 
 @nki.jit
@@ -815,8 +833,6 @@ def flash_paged_attention(
                          max_seqlen_k,
                          max_num_seqs=max_num_seqs,
                          block_size=block_size)
-    # cu_query_lens, cu_ctx_lens_blockaligned, ctx_lens, max_query_lens, max_seq_lens, max_num_seqs, block_size)
-    # cu_query_lens, cu_query_lens, query_lens, max_query_lens, max_query_lens, max_num_seqs, block_size, contexted=True)
 
     for large_k_tile_idx in nl.sequential_range(0, num_large_k_tile):
         num_loads = ceil_div(num_blocks_per_large_tile, B_P_SIZE)
@@ -841,10 +857,17 @@ def flash_paged_attention(
         )
 
         for i in nl.affine_range(n_tile_q):
-            cur_mask = nl.load(mask[
+            # cur_mask = nl.load(mask[
+            #     nl.ds(i * B_P_SIZE, B_P_SIZE),
+            #     nl.ds(large_k_tile_idx * LARGE_TILE_SZ, LARGE_TILE_SZ),
+            # ])
+            cur_mask = nl.load(prior_mask[
+                0,
                 nl.ds(i * B_P_SIZE, B_P_SIZE),
                 nl.ds(large_k_tile_idx * LARGE_TILE_SZ, LARGE_TILE_SZ),
             ])
+            if tiled_block_size > 1:
+                cur_mask = transpose_kv_token_mask(cur_mask, tiled_block_size)
             for i_q_h in nl.affine_range(q_h_per_k_h):
                 q_tile = nl.ndarray((B_D_SIZE, B_P_SIZE), dtype=kernel_dtype)
                 q_hbm_tile = query[batch_id, head_id * q_h_per_k_h + i_q_h]
@@ -918,9 +941,14 @@ def flash_paged_attention(
             )
 
         for i in nl.affine_range(n_tile_q):
-            cur_mask = nl.load(mask[
+            # cur_mask = nl.load(mask[
+            #     nl.ds(i * B_P_SIZE, B_P_SIZE),
+            #     nl.ds(context_kv_len, LARGE_TILE_SZ),
+            # ])
+            cur_mask = nl.load(active_mask[
+                0,
                 nl.ds(i * B_P_SIZE, B_P_SIZE),
-                nl.ds(context_kv_len, LARGE_TILE_SZ),
+                nl.ds(0, LARGE_TILE_SZ),
             ])
             for i_q_h in nl.affine_range(q_h_per_k_h):
 
@@ -996,7 +1024,7 @@ def flash_paged_attention(
 
     if return_debug_tensors:
         return o, hbm_m_buffer, hbm_l_buffer, hbm_qk_res
-    return o
+    return o # , prior_mask, active_mask
 
 
 def reorder_context_mask(mask, LARGE_TILE_SZ, block_size):
