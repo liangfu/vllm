@@ -541,7 +541,7 @@ def build_attention_mask(
         k_slice = nl.ds(k_tile_idx * k_tile_size, k_tile_size)
         q_bound = (q_tile_idx * q_tile_size + i_p) < max_num_queries
         k_bound = (k_tile_idx * k_tile_size + i_f) < max_num_keys
-        nl.store(prior_mask[0, q_slice, k_slice],
+        nl.store(prior_mask[q_slice, k_slice],
                  value=0,
                  mask=q_bound & k_bound)
 
@@ -576,9 +576,9 @@ def build_attention_mask(
             q_bound = (q_tile_idx * q_tile_size + i_p) < max_num_queries
             k_bound = (k_tile_idx * k_tile_size + i_f) < max_num_keys
 
-            new_mask = nl.load(prior_mask[0, q_slice, k_slice],
+            new_mask = nl.load(prior_mask[q_slice, k_slice],
                                mask=q_bound & k_bound) | new_mask[i_p, i_f]
-            nl.store(prior_mask[0, q_slice, k_slice],
+            nl.store(prior_mask[q_slice, k_slice],
                      new_mask[i_p, i_f],
                      mask=q_bound & k_bound)
 
@@ -603,6 +603,7 @@ def transpose_kv_token_mask(mask, tiled_block_size):
     B_P_SIZE = 128
     assert num_block >= B_P_SIZE
     num_batch = num_block // B_P_SIZE
+    print(f"{size_q=}, {num_batch=}, {B_P_SIZE=}, {tiled_block_size=}")
     i_f1 = nl.arange(num_batch)[None, :, None, None]
     i_f2 = nl.arange(B_P_SIZE)[None, None, :, None]
     i_f3 = nl.arange(tiled_block_size)[None, None, None, :]
@@ -615,8 +616,8 @@ def transpose_kv_token_mask(mask, tiled_block_size):
     new_mask[i_p, i_f_dst] = nl.copy(mask[i_p, i_f_src])
     return new_mask
 
-
-@nki.jit
+@nki.compiler.skip_middle_end_transformations
+@nki.jit(show_compiler_tb=True)
 def flash_paged_attention(
     query,
     key,
@@ -776,6 +777,7 @@ def flash_paged_attention(
     else:
         block_size_tiling_factor = 1
     tiled_block_size = block_size // block_size_tiling_factor
+    print(f"{tiled_block_size=}, {block_size=}, {block_size_tiling_factor=}")
 
     # Indirect DMA load must be placed along Partition Dimension
     block_tables_sbuf = transform_block_tables_for_indirect_load(
@@ -815,12 +817,14 @@ def flash_paged_attention(
 
     max_num_seqs = cu_seqlens_q.shape[0] - 1
 
-    prior_mask = nl.ndarray((1, max_seqlen_q, max_seqlen_k),
+    prior_mask = nl.ndarray((max_seqlen_q, max_seqlen_k),
                             dtype=nl.bool_,
                             buffer=nl.private_hbm)
-    active_mask = nl.ndarray((1, max_seqlen_q, max_seqlen_q),
+    active_mask = nl.ndarray((max_seqlen_q, max_seqlen_q),
                              dtype=nl.bool_,
                              buffer=nl.private_hbm)
+    mask_output = nl.ndarray((k_h, num_large_k_tile, B_P_SIZE, LARGE_TILE_SZ), buffer=nl.shared_hbm, dtype=nl.bool_)
+    print(f"{num_large_k_tile=}, {n_tile_q=}, {B_P_SIZE=}, {LARGE_TILE_SZ=}")
 
     i_p = nl.arange(1)[:, None]
     i_f = nl.arange(max_num_seqs)[None, :]
@@ -833,6 +837,15 @@ def flash_paged_attention(
                          max_seqlen_k,
                          max_num_seqs=max_num_seqs,
                          block_size=block_size)
+
+    for large_k_tile_idx in nl.sequential_range(0, num_large_k_tile):
+        cur_mask = nl.load(prior_mask[
+            nl.ds(0, B_P_SIZE),
+            nl.ds(large_k_tile_idx * LARGE_TILE_SZ, LARGE_TILE_SZ),
+        ])
+        # if tiled_block_size > 1:
+        #     cur_mask = transpose_kv_token_mask(cur_mask, tiled_block_size)
+        nl.store(mask_output[head_id, large_k_tile_idx, :, :], cur_mask[:, :])
 
     for large_k_tile_idx in nl.sequential_range(0, num_large_k_tile):
         num_loads = ceil_div(num_blocks_per_large_tile, B_P_SIZE)
@@ -857,17 +870,17 @@ def flash_paged_attention(
         )
 
         for i in nl.affine_range(n_tile_q):
-            # cur_mask = nl.load(mask[
-            #     nl.ds(i * B_P_SIZE, B_P_SIZE),
-            #     nl.ds(large_k_tile_idx * LARGE_TILE_SZ, LARGE_TILE_SZ),
-            # ])
-            cur_mask = nl.load(prior_mask[
-                0,
+            cur_mask = nl.load(mask[
                 nl.ds(i * B_P_SIZE, B_P_SIZE),
                 nl.ds(large_k_tile_idx * LARGE_TILE_SZ, LARGE_TILE_SZ),
             ])
-            if tiled_block_size > 1:
-                cur_mask = transpose_kv_token_mask(cur_mask, tiled_block_size)
+            # cur_mask = nl.load(prior_mask[
+            #     nl.ds(i * B_P_SIZE, B_P_SIZE),
+            #     nl.ds(large_k_tile_idx * LARGE_TILE_SZ, LARGE_TILE_SZ),
+            # ])
+            # if tiled_block_size > 1:
+            #     cur_mask = transpose_kv_token_mask(cur_mask, tiled_block_size)
+            # nl.store(mask_output[large_k_tile_idx, i, :, :], cur_mask[:, :])
             for i_q_h in nl.affine_range(q_h_per_k_h):
                 q_tile = nl.ndarray((B_D_SIZE, B_P_SIZE), dtype=kernel_dtype)
                 q_hbm_tile = query[batch_id, head_id * q_h_per_k_h + i_q_h]
@@ -946,7 +959,6 @@ def flash_paged_attention(
             #     nl.ds(context_kv_len, LARGE_TILE_SZ),
             # ])
             cur_mask = nl.load(active_mask[
-                0,
                 nl.ds(i * B_P_SIZE, B_P_SIZE),
                 nl.ds(0, LARGE_TILE_SZ),
             ])
@@ -1024,7 +1036,7 @@ def flash_paged_attention(
 
     if return_debug_tensors:
         return o, hbm_m_buffer, hbm_l_buffer, hbm_qk_res
-    return o # , prior_mask, active_mask
+    return o, mask_output
 
 
 def reorder_context_mask(mask, LARGE_TILE_SZ, block_size):

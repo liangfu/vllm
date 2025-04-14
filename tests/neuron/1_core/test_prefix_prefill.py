@@ -343,6 +343,8 @@ def test_contexted_kv_attention(
     compiler_flags_str = " ".join([
         "-O1",
         "--retry_failed_compilation",
+        "--enable-internal-data-race-checker",
+        "--internal-compiler-debug-mode=penguin",
     ])
     os.environ["NEURON_CC_FLAGS"] = compiler_flags_str
 
@@ -352,9 +354,9 @@ def test_contexted_kv_attention(
     dtype = torch.float32
 
     min_ctx_len = 2
-    max_ctx_len = 256
-    min_query_len = 64
-    max_query_len = 128
+    max_ctx_len = 12
+    min_query_len = 2
+    max_query_len = 12
     num_kv_heads = num_heads // num_queries_per_kv
     (
         query,
@@ -407,7 +409,8 @@ def test_contexted_kv_attention(
         return 2**int(a - 1).bit_length()
 
     # calculate input shapes
-    max_num_queries = pad_to_next_power_of_2(sum(query_lens))
+    # max_num_queries = pad_to_next_power_of_2(sum(query_lens))
+    max_num_queries = pad_to_multiple(sum(query_lens), B_P_SIZE)
     context_lens = torch.tensor(seq_lens) - torch.tensor(query_lens)
     num_active_blocks = ceil_div(context_lens, block_size).sum().item()
     num_active_blocks = pad_to_multiple(num_active_blocks,
@@ -508,11 +511,16 @@ def test_contexted_kv_attention(
         max_seqlen_k=max_seqlen_k,
         block_table=active_block_table.to(device=device),
 
-        # TODO: remove
+        )
+    print(f"{input_kwargs=}")
+
+    # TODO: remove
+    input_kwargs.update(
         attn_mask=attn_mask.to(device=device),
         LARGE_TILE_SZ=large_tile_size)
 
-    output_nki = flash_attn_varlen_func(*input_args, **input_kwargs)
+    # output_nki = flash_attn_varlen_func(*input_args, **input_kwargs)
+    output_nki, mask_output = flash_attn_varlen_func(*input_args, **input_kwargs)
 
     num_actual_tokens = sum(query_lens)
     # - o: shape (bs, n_heads, seq_q, d) -> (bs, seq_q, n_heads, d)
