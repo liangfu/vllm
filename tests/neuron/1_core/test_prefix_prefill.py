@@ -492,31 +492,28 @@ def test_contexted_kv_attention(
                                dtype=torch.int32).cumsum(dim=0,
                                                          dtype=torch.int32)
 
+    def to_device(x):
+        return x.numpy()
+
     input_args = (
-        query.to(device=device),
-        k.to(device=device),
-        v.to(device=device),
-        kv_cache.to(device=device),
+        to_device(query),
+        to_device(k),
+        to_device(v),
+        to_device(kv_cache),
     )
     input_kwargs = dict(
-        # n_kv_head=num_kv_heads,
-        # head_size=head_size,
-        # mixed_precision=mixed_precision,
-        # LARGE_TILE_SZ=large_tile_size,
-        cu_seqlens_q=cu_query_lens.to(device=device),
-        cu_seqlens_k=cu_seq_lens.to(
-            device=device),  # TODO(liangfu): deprecate cu_seqlens_k
-        seqused_k=seqused_k.to(device=device),
+        cu_seqlens_q=to_device(cu_query_lens),
+        cu_seqlens_k=to_device(cu_seq_lens),
+        seqused_k=to_device(seqused_k),
         max_seqlen_q=max_seqlen_q,
         max_seqlen_k=max_seqlen_k,
-        block_table=active_block_table.to(device=device),
-
-        )
+        block_table=to_device(active_block_table),
+    )
     print(f"{input_kwargs=}")
 
     # TODO: remove
     input_kwargs.update(
-        attn_mask=attn_mask.to(device=device),
+        attn_mask=to_device(attn_mask),
         LARGE_TILE_SZ=large_tile_size)
 
     # output_nki = flash_attn_varlen_func(*input_args, **input_kwargs)

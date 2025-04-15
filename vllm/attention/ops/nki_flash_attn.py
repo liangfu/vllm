@@ -515,19 +515,22 @@ def build_attention_mask(
     i_f = nl.arange(k_tile_size)[None, :]
 
     def _br(x):
-        return x.broadcast_to((
-            q_tile_size,
-            k_tile_size,
-        ))
+        shape = (q_tile_size, k_tile_size)
+        return x
+    def _br2(x):
+        shape = (q_tile_size, k_tile_size)
+        return nl.broadcast_to(x, shape=shape)
 
+    a = nl.ndarray((q_tile_size, k_tile_size), buffer=nl.sbuf, dtype=nl.int32)
+    b = nl.ndarray((q_tile_size, k_tile_size), buffer=nl.sbuf, dtype=nl.int32)
     # expr_a = nl.arange(0, k_tile_size)[None, :]
     expr_a = nl.arange(0, q_tile_size)[:, None]
     a_tile = nisa.iota(expr_a, dtype=nl.int32)
-    a = _br(a_tile)
+    a[:, :] = _br2(a_tile)
     # expr_b = nl.arange(0, q_tile_size)[:, None]
     expr_b = nl.arange(0, k_tile_size)[None, :]
     b_tile = nisa.iota(expr_b, dtype=nl.int32)
-    b = _br(b_tile)
+    b[:, :] = _br2(b_tile)
     print(f"{a.shape=}, {b.shape=}, {a_tile.shape=}, {b_tile.shape=}")
 
     # iota_hbm = nl.ndarray((2, q_tile_size, k_tile_size), dtype=nl.int32, buffer=nl.shared_hbm)
@@ -545,17 +548,27 @@ def build_attention_mask(
                  value=0,
                  mask=q_bound & k_bound)
 
+    ri = nl.ndarray((q_tile_size, k_tile_size), buffer=nl.sbuf, dtype=nl.int32)
+    ci = nl.ndarray((q_tile_size, k_tile_size), buffer=nl.sbuf, dtype=nl.int32)
+    nr = nl.ndarray((q_tile_size, k_tile_size), buffer=nl.sbuf, dtype=nl.int32)
+    nc = nl.ndarray((q_tile_size, k_tile_size), buffer=nl.sbuf, dtype=nl.int32)
+    tile_offset = nl.ndarray((q_tile_size, k_tile_size), buffer=nl.sbuf, dtype=nl.int32)
+
     # Process each sequence
     for seq_idx in nl.sequential_range(max_num_seqs):
-        ri = _br(cu_query_lens_sbuf[0, seq_idx])
-        ci = _br(cu_ctx_lens_sbuf[0, seq_idx])
-        nr = _br(query_lens[0, seq_idx])
-        nc = _br(ctx_lens[0, seq_idx])
+        # ri = _br(cu_query_lens_sbuf[0, seq_idx])
+        # ci = _br(cu_ctx_lens_sbuf[0, seq_idx])
+        # nr = _br(query_lens[0, seq_idx])
+        # nc = _br(ctx_lens[0, seq_idx])
+        ri[:, :] = _br(cu_query_lens_sbuf[0, seq_idx])
+        ci[:, :] = _br(cu_ctx_lens_sbuf[0, seq_idx])
+        nr[:, :] = _br(query_lens[0, seq_idx])
+        nc[:, :] = _br(ctx_lens[0, seq_idx])
         print(f"{ci.shape=}, {nc.shape=}, {ri.shape=}, {nr.shape=}")
 
         for k_tile_idx in nl.sequential_range(n_k_tile):
             q_tile_idx = 0
-            tile_offset = _br(b_tile[0, k_tile_idx] * k_tile_size)
+            tile_offset[:, :] = _br2(b_tile[0, k_tile_idx] * k_tile_size)
 
             if contexted:
                 a_offset = (ci + nc) - (ri + nr)
@@ -566,8 +579,8 @@ def build_attention_mask(
 
             # nl.store(new_mask_hbm[seq_idx, k_tile_idx, :, :], new_mask)
 
-            left_mask = b >= (ci - tile_offset)
-            top_mask = a >= ri
+            left_mask = nl.greater_equal(b, ci - tile_offset)
+            top_mask = nl.greater_equal(a, ri)
             bottom_mask = nl.less(a, ri + nr)
             new_mask = new_mask & left_mask & top_mask & bottom_mask
 
@@ -616,8 +629,15 @@ def transpose_kv_token_mask(mask, tiled_block_size):
     new_mask[i_p, i_f_dst] = nl.copy(mask[i_p, i_f_src])
     return new_mask
 
+
+import uuid
+
 @nki.compiler.skip_middle_end_transformations
-@nki.jit(show_compiler_tb=True)
+@nki.baremetal(artifacts_dir=f"./_artifact_{str(uuid.uuid4().hex)[:8]}",
+               additional_compile_opt=" -O1 --model-type=transformer --lnc=1 --enable-internal-data-race-checker --internal-compiler-debug-mode=penguin ",
+               debug_kernel=True,
+               show_compiler_tb=True,
+)
 def flash_paged_attention(
     query,
     key,
