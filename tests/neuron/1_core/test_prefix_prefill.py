@@ -301,7 +301,7 @@ def get_active_block_tables(block_tables, query_lens, seq_lens, block_size,
         # (1, 199, 1, 512, 4, 2, 8, True),  # same with mixed precision
 
         # Test common/medium configurations
-        (1, 3, 4, 512, 4, 2, 4, True),  # common case, larger heads
+        (3, 5, 4, 1024, 4, 2, 4, True),  # common case, larger heads
         # (4, 12, 32, 2048, 16, 4, 32,
         #  True),  # medium size, mixed precision, grouped-query attention (GQA)
 
@@ -342,9 +342,8 @@ def test_contexted_kv_attention(
 
     compiler_flags_str = " ".join([
         "-O1",
+        "--tensorizer-options='--skip-pass=NeuronValueNumbering'",
         "--retry_failed_compilation",
-        "--enable-internal-data-race-checker",
-        "--internal-compiler-debug-mode=penguin",
     ])
     os.environ["NEURON_CC_FLAGS"] = compiler_flags_str
 
@@ -487,13 +486,15 @@ def test_contexted_kv_attention(
     max_seqlen_q = max_num_queries
     max_seqlen_k = context_kv_len
 
-    # TODO(liangfu): remove cu_seq_lens for sequence-aligned implementation
-    cu_seq_lens = torch.tensor([0] + seq_lens,
+    # TODO(liangfu): remove cu_ctx_lens for sequence-aligned implementation
+    ctx_lens = (torch.tensor(seq_lens) - torch.tensor(query_lens)).tolist()
+    cu_ctx_lens = torch.tensor([0] + ctx_lens,
                                dtype=torch.int32).cumsum(dim=0,
                                                          dtype=torch.int32)
 
     def to_device(x):
-        return x.numpy()
+        # return x.numpy()
+        return x.to(device=device)
 
     input_args = (
         to_device(query),
@@ -503,7 +504,7 @@ def test_contexted_kv_attention(
     )
     input_kwargs = dict(
         cu_seqlens_q=to_device(cu_query_lens),
-        cu_seqlens_k=to_device(cu_seq_lens),
+        cu_seqlens_k=to_device(cu_ctx_lens),
         seqused_k=to_device(seqused_k),
         max_seqlen_q=max_seqlen_q,
         max_seqlen_k=max_seqlen_k,
@@ -517,7 +518,7 @@ def test_contexted_kv_attention(
         LARGE_TILE_SZ=large_tile_size)
 
     # output_nki = flash_attn_varlen_func(*input_args, **input_kwargs)
-    output_nki, mask_output = flash_attn_varlen_func(*input_args, **input_kwargs)
+    output_nki = flash_attn_varlen_func(*input_args, **input_kwargs)
 
     num_actual_tokens = sum(query_lens)
     # - o: shape (bs, n_heads, seq_q, d) -> (bs, seq_q, n_heads, d)
