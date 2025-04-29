@@ -574,57 +574,11 @@ class NeuronModelRunner:
         context_kv_len = num_active_blocks * self.block_size
 
         block_table = self.input_batch.block_table.get_cpu_tensor()[:num_reqs]
-        active_block_table = get_active_block_tables(
-            block_table,
-            query_lens,
-            seq_lens,
-            self.block_size,
-            num_active_blocks,
-        )
-
-        prior_mask, active_mask = (
-            BlockDiagonalCausalFromBottomRightMask.from_seqlens(
-                query_lens=query_lens.tolist(),
-                seq_lens=seq_lens.tolist(),
-                block_size=self.block_size))
-
-        attn_mask = torch.concat(
-            [
-                nn.functional.pad(
-                    prior_mask,
-                    (
-                        0,
-                        max(context_kv_len, LARGE_TILE_SZ) -
-                        prior_mask.shape[1],
-                        0,
-                        padded_num_tokens - prior_mask.shape[0],
-                    ),
-                    "constant",
-                    0,
-                ).bool(),
-                nn.functional.pad(
-                    active_mask,
-                    (
-                        0,
-                        padded_num_tokens - active_mask.shape[1],
-                        0,
-                        padded_num_tokens - active_mask.shape[0],
-                    ),
-                    "constant",
-                    0,
-                ).bool(),
-            ],
-            dim=1,
-        )
-        attn_mask = reorder_context_mask(attn_mask,
-                                         LARGE_TILE_SZ=LARGE_TILE_SZ,
-                                         block_size=self.block_size)
 
         logits_indices = query_start_loc[1:] - 1
         query_start_loc = query_start_loc.to(self.device)
         seq_start_loc = seq_start_loc.to(self.device)
         slot_mapping = slot_mapping.long().to(self.device)
-        active_block_table = active_block_table.to(torch.int32).to(self.device)
         attn_mask = attn_mask.to(self.device)
         attn_metadata = NeuronAttentionMetadata(
             num_actual_tokens=total_num_scheduled_tokens,
@@ -632,8 +586,7 @@ class NeuronModelRunner:
             query_start_loc=query_start_loc,
             max_seq_len=max_seq_len,
             seq_start_loc=seq_start_loc,
-            block_table=self.input_batch.block_table.get_device_tensor()
-            [:num_reqs],
+            block_table=self.input_batch.block_table.get_device_tensor()[:num_reqs],
             slot_mapping=slot_mapping,
             num_active_blocks=num_active_blocks,
             active_block_table=active_block_table,
@@ -953,46 +906,18 @@ class NeuronModelRunner:
         num_active_blocks = num_active_blocks_shifted * num_active_blocks_factor
         block_table = torch.arange((num_tokens // self.block_size) +
                                    1).unsqueeze(0)
-        active_block_table = get_active_block_tables(
-            block_table,
-            torch.tensor([num_tokens]),
-            torch.tensor([num_tokens]),
-            self.block_size,
-            num_active_blocks,
-        )
-
-        attn_mask, _ = BlockDiagonalCausalFromBottomRightMask.from_seqlens(
-            query_lens=[num_tokens], seq_lens=[num_tokens])
-        attn_mask = nn.functional.pad(
-            attn_mask,
-            (
-                0,
-                LARGE_TILE_SZ + num_tokens - attn_mask.shape[1],
-                0,
-                B_P_SIZE - attn_mask.shape[0],
-            ),
-            "constant",
-            0,
-        ).bool()
 
         attn_metadata = NeuronAttentionMetadata(
             num_actual_tokens=num_tokens,
             max_query_len=num_tokens,
-            query_start_loc=torch.tensor([0, num_tokens - 1
-                                          ]).to(self.device,
-                                                non_blocking=True),
+            query_start_loc=torch.tensor([0, num_tokens - 1]).to(self.device),
             max_seq_len=num_tokens,
-            seq_start_loc=torch.tensor([0,
-                                        num_tokens - 1]).to(self.device,
-                                                            non_blocking=True),
+            seq_start_loc=torch.tensor([0, num_tokens - 1]).to(self.device),
             block_table=block_table,
-            slot_mapping=torch.arange(0,
-                                      num_tokens).long().to(self.device,
-                                                            non_blocking=True),
+            slot_mapping=torch.arange(0, num_tokens).long().to(self.device),
             num_active_blocks=num_active_blocks,
-            active_block_table=active_block_table.to(torch.int32).to(
-                self.device, non_blocking=True),
-            attn_mask=attn_mask.to(self.device, non_blocking=True))
+            block_table=block_table,
+        )
 
         if self.is_multimodal_model:
             input_ids = None
@@ -1201,91 +1126,6 @@ class NeuronModelRunner:
 
 def shift_bit_length(x):
     return 1 << (x - 1).bit_length()
-
-
-def get_active_block_tables(block_tables, query_lens, seq_lens, block_size,
-                            num_blocks):
-    context_lens = seq_lens - query_lens
-    blocks_per_seq = (context_lens + block_size - 1) // block_size
-    num_seqs = len(seq_lens)
-    active_blocks: list[int] = []
-    for seq_id in range(num_seqs):
-        active_blocks = (
-            active_blocks +
-            block_tables[seq_id, :blocks_per_seq[seq_id]].tolist())
-    return nn.functional.pad(
-        torch.tensor(active_blocks),
-        (0, num_blocks - len(active_blocks)),
-        "constant",
-        0,
-    )
-
-
-class BlockDiagonalCausalFromBottomRightMask:
-
-    @staticmethod
-    def _from_seqlens(query_lens, seq_lens, block_size=None):
-        from torch import logical_and, logical_or
-
-        contexted = block_size is None
-        context_lens = torch.tensor(seq_lens) - torch.tensor(query_lens)
-        n_queries = sum(query_lens)
-        num_seqs = len(query_lens)
-        if contexted:
-            key_lens_blockaligned = seq_lens
-        else:
-            n_blocks_per_seq = (context_lens + block_size - 1) // block_size
-            offset_per_seq = n_blocks_per_seq * block_size
-            key_lens_blockaligned = offset_per_seq[:num_seqs].tolist()
-        n_keys = sum(key_lens_blockaligned)
-
-        a = (torch.arange(n_queries).reshape(n_queries,
-                                             1).expand(n_queries, n_keys))
-        b = torch.arange(n_keys).reshape(1, n_keys).expand(n_queries, n_keys)
-        q_cumsum = torch.tensor([0] + query_lens).cumsum(dim=0)
-        k_cumsum = torch.tensor([0] + key_lens_blockaligned).cumsum(dim=0)
-
-        prior_mask = torch.zeros(n_queries, n_keys)
-        new_masks: list[torch.Tensor] = []
-        for seq_id in range(num_seqs):
-            ri = q_cumsum[seq_id]
-            ci = k_cumsum[seq_id]
-            nr = query_lens[seq_id]
-
-            if contexted:
-                nc = seq_lens[seq_id]
-                a_offset = ci + nc - ri - nr
-                new_mask = (a + a_offset) >= b
-            else:
-                nc = context_lens[seq_id]
-                a_offset = ci + nc - 1
-                new_mask = a_offset >= b
-
-            left_mask = b >= ci
-            top_mask = a >= ri
-            bottom_mask = a < (ri + nr)
-
-            new_mask = logical_and(
-                logical_and(logical_and(new_mask, left_mask), top_mask),
-                bottom_mask,
-            )
-            prior_mask = logical_or(prior_mask, new_mask)
-            new_masks = new_masks + [new_mask]
-        return prior_mask
-
-    @staticmethod
-    def from_seqlens(query_lens, seq_lens, block_size=None):
-        contexted = block_size is None
-        if contexted:
-            prior_mask = BlockDiagonalCausalFromBottomRightMask._from_seqlens(
-                query_lens, seq_lens)
-            active_mask = None
-        else:
-            prior_mask = BlockDiagonalCausalFromBottomRightMask._from_seqlens(
-                query_lens, seq_lens, block_size)
-            active_mask = BlockDiagonalCausalFromBottomRightMask._from_seqlens(
-                query_lens, query_lens)
-        return prior_mask, active_mask
 
 
 def _get_req_paddings(min_req_size: int, max_req_size: int) -> list[int]:

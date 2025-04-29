@@ -10,13 +10,12 @@ from vllm.attention.backends.abstract import (AttentionBackend, AttentionImpl,
 from vllm.attention.backends.utils import CommonAttentionState
 
 
-@torch.library.custom_op("mylib::neuron_paged_attn", mutates_args=())
+@torch.library.custom_op("vllm::neuron_paged_attn", mutates_args=())
 def neuron_paged_attn(
     query: torch.Tensor,
     key: torch.Tensor,
     value: torch.Tensor,
     kv_cache: torch.Tensor,
-    # value_cache: torch.Tensor,
     block_table: torch.Tensor,
     attn_mask: torch.Tensor,
 ) -> torch.Tensor:
@@ -28,7 +27,6 @@ def neuron_paged_attn(
         key=key,
         value=value,
         kv_cache=kv_cache,
-        # value_cache=value_cache,
         block_table=block_table,
         attn_mask=attn_mask,
         n_kv_head=n_kv_head,
@@ -44,7 +42,6 @@ def _(
     key: torch.Tensor,
     value: torch.Tensor,
     kv_cache: torch.Tensor,
-    # value_cache: torch.Tensor,
     block_table: torch.Tensor,
     attn_mask: torch.Tensor,
 ) -> torch.Tensor:
@@ -170,7 +167,6 @@ class NeuronAttentionBackendImpl(AttentionImpl[NeuronAttentionMetadata]):
             key,
             value,
             kv_cache,
-            # kv_cache,
             attn_metadata.active_block_table,
             attn_metadata.attn_mask,
         )
