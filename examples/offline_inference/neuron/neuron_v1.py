@@ -23,6 +23,7 @@ llm = LLM(
     # and prefix-caching.
     max_num_seqs=8,
     max_num_batched_tokens=128,
+    num_gpu_blocks_override=512,
 )
 
 # Generate texts from the prompts. The output is a list of RequestOutput objects

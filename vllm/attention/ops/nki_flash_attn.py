@@ -472,6 +472,7 @@ def flash_paged_attention(
     b, h, d, seqlen_q = query.shape
     B_D_SIZE = d
     n_tile_q = seqlen_q // B_P_SIZE  # since q will be loaded on tensor engine
+    assert n_tile_q >= 1, f"{seqlen_q=} is expected to be multiple of {B_P_SIZE=}"
     _, num_blocks, k_h, block_size, _ = kv_cache.shape
     q_h_per_k_h = h // k_h
     assert b == 1, f"invalid batch size {b=}"

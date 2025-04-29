@@ -1,31 +1,38 @@
 # SPDX-License-Identifier: Apache-2.0
-
 import bisect
+import gc
 import time
-from typing import TYPE_CHECKING, Optional
+from typing import TYPE_CHECKING, Optional, cast
+from unittest.mock import patch
 
 import numpy as np
 import torch
 import torch.distributed
 import torch.nn as nn
+# XLA related
 import torch_xla.core.xla_model as xm
+import torch_xla.runtime as xr
 
-from vllm.attention import AttentionType
+import vllm.envs as envs
+from vllm.attention.backends.abstract import AttentionType
 from vllm.attention.layer import Attention
+from vllm.compilation.wrapper import TorchCompileWrapperWithCustomDispatcher
 from vllm.config import VllmConfig
 from vllm.forward_context import set_forward_context
-from vllm.inputs import INPUT_REGISTRY
 from vllm.logger import init_logger
-from vllm.model_executor.layers.rotary_embedding import MRotaryEmbedding
 from vllm.model_executor.model_loader import get_model
-from vllm.multimodal import MultiModalKwargs
-from vllm.sampling_params import SamplingType
+from vllm.multimodal import MULTIMODAL_REGISTRY
+from vllm.multimodal.inputs import (BatchedTensorInputs, MultiModalKwargs,
+                                    PlaceholderRange)
+from vllm.multimodal.utils import group_mm_inputs_by_modality
 from vllm.sequence import IntermediateTensors
-from vllm.utils import STR_DTYPE_TO_TORCH_DTYPE, LayerBlockType, cdiv
+from vllm.utils import LayerBlockType, cdiv, is_pin_memory_available
 from vllm.v1.attention.backends.neuron_attn import (NeuronAttentionBackend,
                                                     NeuronAttentionMetadata)
-from vllm.v1.kv_cache_interface import (FullAttentionSpec, KVCacheConfig,
-                                        KVCacheSpec)
+from vllm.v1.core.encoder_cache_manager import compute_encoder_budget
+from vllm.v1.kv_cache_interface import (AttentionSpec, FullAttentionSpec,
+                                        KVCacheConfig, KVCacheSpec,
+                                        SlidingWindowSpec)
 from vllm.v1.outputs import (EMPTY_MODEL_RUNNER_OUTPUT, LogprobsTensors,
                              ModelRunnerOutput)
 from vllm.v1.sample.neuron.metadata import NeuronSupportedSamplingMetadata
@@ -34,21 +41,56 @@ from vllm.v1.utils import bind_kv_cache
 from vllm.v1.worker.gpu_input_batch import CachedRequestState, InputBatch
 
 if TYPE_CHECKING:
-    from vllm.v1.core.scheduler import SchedulerOutput
+    from vllm.v1.core.sched.output import SchedulerOutput
 
 logger = init_logger(__name__)
 
 B_P_SIZE = 128
 LARGE_TILE_SZ = 2048
+
+# Here we utilize the behavior that out-of-bound index is ignored.
+# FIXME(woosuk): Find a more reliable way to prevent possible bugs.
+_PAD_SLOT_ID = 1_000_000_000
 INVALID_TOKEN_ID = -1
 # Smallest output size
 MIN_NUM_SEQS = 8
 
 
-def shift_bit_length(x):
-    return 1 << (x - 1).bit_length()
-
-
+#########################################################
+# Ways to avoid recompilation
+#########################################################
+#
+# The model executor has two primary components:
+# 1. preparing the model and sampler inputs
+# 2. executing the model and sampler.
+# The core idea is to avoid any TPU computation during input preparation. For
+# better compilation tracking and increased flexibility, the model execution and
+# sampler are divided into several distinct components.
+#
+# Below are the detailed steps:
+#
+# Step 1
+# It is recommended to avoid TPU operations when preparing the model and sampler
+# inputs. CPU tensors can be prepared and transferred to the XLA device using
+# cpu_tensor.to(xla_device), which only triggers CPU to TPU transfers and avoids
+# compilation.
+#
+# Step 2
+# The TPU execution should be decomposed into subgraphs (4 at the moment):
+# 1. the main model
+# 2. selecting hidden states for each request
+# 3. sampler
+# 4. encoder.
+# Each subgraph should be decorated in a torch.compile. This is used to make
+# sure that we have the same subgraph topology in both dummy_run and
+# xecute_model. The results from these subgraphs should either be passed to
+# other subgraphs, or transferred from TPU to CPU using xla_tensor.cpu() for
+# subsequent processing on the CPU.
+#
+# Step 3
+# The dummy_run should be comprehensive, ensuring all potential input shapes and
+# branch predictions are included as subgraph inputs to facilitate
+# pre-compilation.
 class NeuronModelRunner:
 
     def __init__(
@@ -66,27 +108,39 @@ class NeuronModelRunner:
         self.speculative_config = vllm_config.speculative_config
         self.prompt_adapter_config = vllm_config.prompt_adapter_config
         self.observability_config = vllm_config.observability_config
+        self.device_config = vllm_config.device_config
 
         model_config = self.model_config
         cache_config = self.cache_config
         scheduler_config = self.scheduler_config
         parallel_config = self.parallel_config
         self.device = device
-        self.pin_memory = False
+        self.check_recompilation = envs.VLLM_XLA_CHECK_RECOMPILATION
+
+        self.enforce_eager = model_config.enforce_eager
+
+        self.num_xla_graphs = 0
+        self._update_num_xla_graphs("init")
+
+        self.pin_memory = is_pin_memory_available()
         self.dtype = self.model_config.dtype
-        if cache_config.cache_dtype == "auto":
-            self.kv_cache_dtype = self.dtype
-        else:
-            self.kv_cache_dtype = STR_DTYPE_TO_TORCH_DTYPE[
-                cache_config.cache_dtype]
+        self._hidden_states_dtype = self.dtype
 
         self.is_multimodal_model = model_config.is_multimodal_model
         self.sliding_window = model_config.get_sliding_window()
         self.block_size = cache_config.block_size
         self.max_model_len = model_config.max_model_len
         self.max_num_blocks_per_req = cdiv(self.max_model_len, self.block_size)
-        self.max_num_tokens = scheduler_config.max_num_batched_tokens
-        self.max_num_reqs = scheduler_config.max_num_seqs
+        # InputBatch needs to work with sampling tensors greater than padding
+        # to avoid dynamic shapes. Also, avoid suboptimal alignment.
+        self.max_num_reqs = max(scheduler_config.max_num_seqs, MIN_NUM_SEQS)
+        self.num_tokens_paddings = _get_token_paddings(
+            min_token_size=128,
+            max_token_size=scheduler_config.max_num_batched_tokens,
+            padding_gap=0)
+        # In case `max_num_tokens < max(num_tokens_paddings)` use the actual
+        # padded max value to pre-allocate data structures and pre-compile.
+        self.max_num_tokens = self.num_tokens_paddings[-1]
 
         # Model-related.
         self.num_attn_layers = model_config.get_num_layers_by_block_type(
@@ -96,10 +150,21 @@ class NeuronModelRunner:
         self.num_kv_heads = model_config.get_num_kv_heads(parallel_config)
         self.head_size = model_config.get_head_size()
         self.hidden_size = model_config.get_hidden_size()
+        self.vocab_size = model_config.get_vocab_size()
 
         # Multi-modal data support
-        self.input_registry = INPUT_REGISTRY
+        self.mm_registry = MULTIMODAL_REGISTRY
         self.uses_mrope = model_config.uses_mrope
+        # TODO: Support M-RoPE (e.g, Qwen2-VL)
+        assert not self.uses_mrope, "Neuron does not support M-RoPE yet."
+
+        encoder_compute_budget, encoder_cache_size = compute_encoder_budget(
+            model_config=model_config,
+            scheduler_config=scheduler_config,
+            mm_registry=self.mm_registry,
+        )
+        self.max_num_encoder_input_tokens = encoder_compute_budget
+        self.encoder_cache_size = encoder_cache_size
 
         # Lazy initialization
         # self.model: nn.Module  # Set after load_model
@@ -116,17 +181,30 @@ class NeuronModelRunner:
             max_num_blocks_per_req=self.max_num_blocks_per_req,
             device="cpu",
             pin_memory=self.pin_memory,
-            vocab_size=model_config.get_vocab_size(),
+            vocab_size=self.vocab_size,
         )
 
-        self.input_ids = torch.zeros(self.max_num_tokens,
-                                     dtype=torch.int32,
-                                     device="cpu")
-        self.positions = torch.zeros(self.max_num_tokens,
-                                     dtype=torch.int64,
-                                     device="cpu")
-        # None in the first PP rank. The rest are set after load_model.
-        self.intermediate_tensors: Optional[IntermediateTensors] = None
+        # Cached torch/numpy tensor
+        # The pytorch tensor and numpy array share the same buffer.
+        # Sometimes the numpy op is faster so we create both.
+        self.input_ids_cpu = torch.zeros(self.max_num_tokens,
+                                         dtype=torch.int32,
+                                         device="cpu")
+        self.input_ids_np = self.input_ids_cpu.numpy()
+
+        self.positions_cpu = torch.zeros(self.max_num_tokens,
+                                         dtype=torch.int32,
+                                         device="cpu")
+        self.positions_np = self.positions_cpu.numpy()
+
+        self.slot_mapping_cpu = torch.zeros(self.max_num_tokens,
+                                            dtype=torch.int64,
+                                            device="cpu")
+        self.slot_mapping_np = self.slot_mapping_cpu.numpy()
+        self.block_table_cpu = torch.zeros(
+            (self.max_num_reqs, self.max_num_blocks_per_req),
+            dtype=self.input_batch.block_table.get_cpu_tensor().dtype,
+            device="cpu")
 
         self.query_start_loc_cpu = torch.zeros(self.max_num_tokens + 1,
                                                dtype=torch.int32,
@@ -134,50 +212,91 @@ class NeuronModelRunner:
                                                pin_memory=self.pin_memory)
         self.query_start_loc_np = self.query_start_loc_cpu.numpy()
 
-        # Only relevant for models using M-RoPE (e.g, Qwen2-VL)
-        if self.uses_mrope:
-            # NOTE: `mrope_positions` is implemented with one additional dummy
-            # position on purpose to make it non-contiguous so that it can work
-            # with torch compile.
-            # See detailed explanation in https://github.com/vllm-project/vllm/pull/12128#discussion_r1926431923
+        self.seq_lens_cpu = torch.zeros(self.max_num_tokens,
+                                        dtype=torch.int32,
+                                        device="cpu",
+                                        pin_memory=self.pin_memory)
+        self.seq_lens_np = self.seq_lens_cpu.numpy()
 
-            # NOTE: When M-RoPE is enabled, position ids are 3D regardless of
-            # the modality of inputs. For text-only inputs, each dimension has
-            # identical position IDs, making M-RoPE functionally equivalent to
-            # 1D-RoPE.
-            # See page 5 of https://arxiv.org/abs/2409.12191
-            self.mrope_positions = torch.zeros((3, self.max_num_tokens + 1),
-                                               dtype=torch.int64,
-                                               device="cpu")
-            self.mrope_positions_cpu = torch.zeros(
-                (3, self.max_num_tokens + 1),
-                dtype=torch.int64,
-                device="cpu",
-                pin_memory=self.pin_memory)
+        # Range tensor with values [0 .. self.max_num_tokens - 1].
+        # Used to initialize positions / context_lens / seq_lens
+        # Keep in int64 to avoid overflow with long context
+        self.arange_np = np.arange(self.max_num_tokens, dtype=np.int64)
+        self.num_reqs_paddings = _get_req_paddings(
+            min_req_size=MIN_NUM_SEQS, max_req_size=self.max_num_reqs)
 
-        self.inputs_embeds = torch.zeros(
-            (self.max_num_tokens, self.hidden_size),
-            dtype=self.dtype,
-            device="cpu")
+        # Get maximum number of mm items per modality (batch size).
+        self.max_num_mm_items_by_modality = dict()
+        if (self.is_multimodal_model and self.max_num_encoder_input_tokens > 0
+                and self.encoder_cache_size > 0):
+            max_tokens_by_modality_dict = (
+                MULTIMODAL_REGISTRY.
+                get_max_tokens_per_item_by_nonzero_modality(self.model_config))
+            for modality, max_tokens in max_tokens_by_modality_dict.items():
+                # Check how many items of this modality can be supported by
+                # the encoder budget.
+                encoder_budget = min(self.max_num_encoder_input_tokens,
+                                     self.encoder_cache_size)
 
-        self.neuron_compilation_batch_sizes = list(
-            reversed(
-                self.vllm_config.compilation_config.cudagraph_capture_sizes))
+                max_num_mm_items_encoder_budget = cdiv(encoder_budget,
+                                                       max_tokens)
 
-    def _update_states(self, scheduler_output: "SchedulerOutput") -> None:
+                # Check how many items of this modality can be supported by
+                # the decoder budget.
+                max_mm_items_per_req = self.mm_registry.\
+                    get_mm_limits_per_prompt(self.model_config)[modality]
+
+                # NOTE: We do not consider max_num_batched_tokens on purpose
+                # because the multimodal embeddings can be generated in advance
+                # and chunked prefilled.
+                max_num_mm_items_decoder_budget = self.max_num_reqs * \
+                    max_mm_items_per_req
+
+                max_num_mm_items = min(max_num_mm_items_encoder_budget,
+                                       max_num_mm_items_decoder_budget)
+                self.max_num_mm_items_by_modality[modality] = max_num_mm_items
+
+    def _update_num_xla_graphs(self, case_str):
+        check_comp = self.check_recompilation and not self.enforce_eager
+        if not check_comp:
+            return
+
+        total_cached_graphs = xr.get_num_cached_compilation_graph()
+        new_compiled_graphs = total_cached_graphs - self.num_xla_graphs
+        if new_compiled_graphs == 0:
+            return
+
+        logger.info("Add new %d compiled XLA graphs due to %s",
+                    new_compiled_graphs, case_str)
+        self.num_xla_graphs += new_compiled_graphs
+
+    def _verify_num_xla_graphs(self, case_str):
+        check_comp = self.check_recompilation and not self.enforce_eager
+        if not check_comp:
+            return
+
+        curr_cached_graph = xr.get_num_cached_compilation_graph()
+        assert self.num_xla_graphs == curr_cached_graph, (
+            "Recompilation after warm up is detected during {}."
+            " num_xla_graphs = {} curr_cached_graph = {}".format(
+                case_str, self.num_xla_graphs, curr_cached_graph))
+
+    def _update_states(self, scheduler_output: "SchedulerOutput") -> bool:
         """Update the cached states and the persistent batch with the scheduler
         output.
 
         The updated states are used by the `_prepare_inputs` function to create
         the input GPU tensors for the model.
 
-        The SamplingMetadata is updated and copied to the GPU if there is a
-        new/resumed/paused/finished request in the batch.
+        Returns:
+            True if there is a new/resumed/paused/finished request.
+            If False, we can skip copying SamplingMetadata to the GPU.
         """
         # Remove finished requests from the cached states.
         for req_id in scheduler_output.finished_req_ids:
             self.requests.pop(req_id, None)
             self.encoder_cache.pop(req_id, None)
+
         # Remove the finished requests from the persistent batch.
         # NOTE(woosuk): There could be an edge case where finished_req_ids and
         # scheduled_req_ids overlap. This happens when a request is aborted and
@@ -220,11 +339,6 @@ class NeuronModelRunner:
         for new_req_data in scheduler_output.scheduled_new_reqs:
             req_id = new_req_data.req_id
             sampling_params = new_req_data.sampling_params
-            if sampling_params.sampling_type == SamplingType.RANDOM_SEED:
-                generator = torch.Generator(device=self.device)
-                generator.manual_seed(sampling_params.seed)
-            else:
-                generator = None
 
             self.requests[req_id] = CachedRequestState(
                 req_id=req_id,
@@ -233,40 +347,12 @@ class NeuronModelRunner:
                 mm_inputs=new_req_data.mm_inputs,
                 mm_positions=new_req_data.mm_positions,
                 sampling_params=sampling_params,
-                generator=generator,
+                generator=None,
                 block_ids=new_req_data.block_ids,
                 num_computed_tokens=new_req_data.num_computed_tokens,
                 output_token_ids=[],
                 lora_request=new_req_data.lora_request,
             )
-
-            # Only relevant for models using M-RoPE (e.g, Qwen2-VL)
-            if self.uses_mrope:
-                image_grid_thw = []
-                video_grid_thw = []
-                second_per_grid_ts = []
-                for mm_input in self.requests[req_id].mm_inputs:
-                    if mm_input.get("image_grid_thw") is not None:
-                        image_grid_thw.extend(
-                            mm_input["image_grid_thw"].tolist())
-                    if mm_input.get("video_grid_thw") is not None:
-                        video_grid_thw.extend(
-                            mm_input["video_grid_thw"].tolist())
-                    if mm_input.get("second_per_grid_ts") is not None:
-                        second_per_grid_ts.extend(
-                            mm_input["second_per_grid_ts"])
-
-                hf_config = self.model_config.hf_config
-
-                self.requests[req_id].mrope_positions, \
-                    self.requests[req_id].mrope_position_delta = \
-                    MRotaryEmbedding.get_input_positions_tensor(
-                        self.requests[req_id].prompt_token_ids,
-                        hf_config=hf_config,
-                        image_grid_thw=image_grid_thw,
-                        video_grid_thw=video_grid_thw,
-                        second_per_grid_ts=second_per_grid_ts,
-                    )
 
             req_ids_to_add.append(req_id)
 
@@ -276,20 +362,7 @@ class NeuronModelRunner:
             req_state = self.requests[req_id]
 
             # Update the cached states.
-            num_computed_tokens = req_data.num_computed_tokens
-            req_state.num_computed_tokens = num_computed_tokens
-            # Add the sampled token(s) from the previous step (if any).
-            # This doesn't include "unverified" tokens like spec decode tokens.
-            num_new_tokens = (num_computed_tokens +
-                              len(req_data.new_token_ids) -
-                              req_state.num_tokens)
-            if num_new_tokens == 1:
-                # Avoid slicing list in most common case.
-                req_state.output_token_ids.append(req_data.new_token_ids[-1])
-            elif num_new_tokens > 0:
-                req_state.output_token_ids.extend(
-                    req_data.new_token_ids[-num_new_tokens:])
-            # Update the block IDs.
+            req_state.num_computed_tokens = req_data.num_computed_tokens
             if not req_data.resumed_from_preemption:
                 # Append the new blocks to the existing block IDs.
                 req_state.block_ids.extend(req_data.new_block_ids)
@@ -308,30 +381,9 @@ class NeuronModelRunner:
 
             # Update the persistent batch.
             self.input_batch.num_computed_tokens_cpu[req_index] = (
-                num_computed_tokens)
+                req_data.num_computed_tokens)
             self.input_batch.block_table.append_row(req_data.new_block_ids,
                                                     req_index)
-            # Add new_token_ids to token_ids_cpu.
-            start_token_index = num_computed_tokens
-            end_token_index = num_computed_tokens + len(req_data.new_token_ids)
-            self.input_batch.token_ids_cpu[
-                req_index,
-                start_token_index:end_token_index] = req_data.new_token_ids
-            self.input_batch.num_tokens_no_spec[req_index] = end_token_index
-            # Add spec_token_ids to token_ids_cpu.
-            spec_token_ids = scheduler_output.scheduled_spec_decode_tokens.get(
-                req_id, ())
-            if spec_token_ids:
-                start_index = end_token_index
-                end_token_index += len(spec_token_ids)
-                self.input_batch.token_ids_cpu[
-                    req_index, start_index:end_token_index] = spec_token_ids
-            # NOTE(woosuk): `num_tokens` here may include spec decode tokens.
-            self.input_batch.num_tokens[req_index] = end_token_index
-
-        # Check if the batch has changed. If not, we can skip copying the
-        # sampling metadata from CPU to device.
-        batch_changed = len(removed_req_indices) > 0 or len(req_ids_to_add) > 0
 
         # Add the new or resumed requests to the persistent batch.
         # The smaller empty indices are filled first.
@@ -350,8 +402,55 @@ class NeuronModelRunner:
         if removed_req_indices:
             self.input_batch.condense(removed_req_indices)
 
-        if batch_changed:
-            self.input_batch.refresh_sampling_metadata()
+        return len(unscheduled_req_ids) > 0 or len(req_ids_to_add) > 0
+
+    def get_model(self) -> nn.Module:
+        assert self.model is not None
+        return self.model
+
+    def get_kv_cache_spec(self) -> dict[str, KVCacheSpec]:
+        """
+        Generates the KVCacheSpec by parsing the kv cache format from each
+        Attention module in the static forward context.
+        Returns:
+            KVCacheSpec: A dictionary mapping layer names to their KV cache
+            format. Layers that do not need KV cache are not included.
+        """
+
+        forward_ctx = self.vllm_config.compilation_config.static_forward_context
+        block_size = self.vllm_config.cache_config.block_size
+        kv_cache_spec: dict[str, KVCacheSpec] = {}
+        for layer_name, attn_module in forward_ctx.items():
+            assert isinstance(attn_module, Attention)
+            if attn_module.attn_type == AttentionType.DECODER:
+                if attn_module.sliding_window is not None:
+                    kv_cache_spec[layer_name] = SlidingWindowSpec(
+                        block_size=block_size,
+                        num_kv_heads=attn_module.num_kv_heads,
+                        head_size=attn_module.head_size,
+                        dtype=attn_module.dtype,
+                        sliding_window=attn_module.sliding_window,
+                        use_mla=False,
+                    )
+                else:
+                    kv_cache_spec[layer_name] = FullAttentionSpec(
+                        block_size=block_size,
+                        num_kv_heads=attn_module.num_kv_heads,
+                        head_size=attn_module.head_size,
+                        dtype=attn_module.dtype,
+                        use_mla=False,
+                    )
+            elif attn_module.attn_type in (AttentionType.ENCODER,
+                                           AttentionType.ENCODER_ONLY):
+                # encoder-only attention does not need KV cache.
+                continue
+            elif attn_module.attn_type == AttentionType.ENCODER_DECODER:
+                raise NotImplementedError
+            else:
+                raise ValueError(
+                    f"Unknown attention type: {attn_module.attn_type}")
+
+        return kv_cache_spec
 
     def _prepare_inputs(self, scheduler_output: "SchedulerOutput"):
         from vllm.attention.ops.nki_flash_attn import reorder_context_mask
@@ -361,39 +460,33 @@ class NeuronModelRunner:
         num_reqs = self.input_batch.num_reqs
         assert num_reqs > 0
 
-        with torch.inference_mode():
-            self.input_batch.block_table.commit(num_reqs)
-
         # Get the number of scheduled tokens for each request.
-        # TODO: The Python loop can be slow. Optimize.
-        num_scheduled_tokens = []
-        max_num_scheduled_tokens = 0
+        num_scheduled_tokens_per_req = []
+        max_num_scheduled_tokens_all_reqs = 0
         for req_id in self.input_batch.req_ids[:num_reqs]:
+            assert req_id is not None
             num_tokens = scheduler_output.num_scheduled_tokens[req_id]
-            num_scheduled_tokens.append(num_tokens)
-            max_num_scheduled_tokens = max(max_num_scheduled_tokens,
-                                           num_tokens)
-        num_scheduled_tokens = np.array(num_scheduled_tokens, dtype=np.int32)
-        assert max_num_scheduled_tokens > 0
+            num_scheduled_tokens_per_req.append(num_tokens)
+            max_num_scheduled_tokens_all_reqs = max(
+                max_num_scheduled_tokens_all_reqs, num_tokens)
+        num_scheduled_tokens_per_req = np.array(num_scheduled_tokens_per_req,
+                                                dtype=np.int32)
+        assert max_num_scheduled_tokens_all_reqs > 0
 
         # Get request indices.
         # E.g., [2, 5, 3] -> [0, 0, 1, 1, 1, 1, 1, 2, 2, 2]
-        indices = np.arange(num_reqs)
-        req_indices = np.repeat(indices, num_scheduled_tokens)
+        # For each scheduled token, what are the corresponding req index.
+        req_indices = np.repeat(self.arange_np[:num_reqs],
+                                num_scheduled_tokens_per_req)
 
         # Get batched arange.
         # E.g., [2, 5, 3] -> [0, 1, 0, 1, 2, 3, 4, 0, 1, 2]
-        arange_matrix = np.tile(np.arange(max_num_scheduled_tokens),
-                                (num_reqs, 1))
-        mask = arange_matrix < np.expand_dims(num_scheduled_tokens, axis=1)
-        arange = arange_matrix[mask]
+        # For each scheduled token, what is its position in corresponding req.
+        arange = np.concatenate(
+            [self.arange_np[:n] for n in num_scheduled_tokens_per_req])
 
         # Get positions.
-        positions = torch.empty((total_num_scheduled_tokens, ),
-                                dtype=torch.int32,
-                                device="cpu",
-                                pin_memory=self.pin_memory)
-        positions_np = positions.numpy()
+        positions_np = self.positions_np[:total_num_scheduled_tokens]
         np.add(self.input_batch.num_computed_tokens_cpu[req_indices],
                arange,
                out=positions_np)
@@ -404,16 +497,14 @@ class NeuronModelRunner:
         # where M is the max_model_len.
         token_indices = (positions_np +
                          req_indices * self.input_batch.token_ids_cpu.shape[1])
-        token_indices = torch.from_numpy(token_indices)
-        input_ids = torch.empty((total_num_scheduled_tokens, ),
-                                dtype=torch.int32,
-                                device="cpu",
-                                pin_memory=self.pin_memory)
-        torch.index_select(torch.from_numpy(
-            self.input_batch.token_ids_cpu).flatten(),
+
+        # NOTE(woosuk): We use torch.index_select instead of np.take here
+        # because torch.index_select is much faster than np.take for large
+        # tensors.
+        torch.index_select(self.input_batch.token_ids_cpu_tensor.flatten(),
                            0,
-                           token_indices,
-                           out=input_ids)
+                           torch.from_numpy(token_indices),
+                           out=self.input_ids_cpu[:total_num_scheduled_tokens])
 
         # Calculate the slot mapping.
         # E.g., [0, 1, 0, 1, 2, 3, 4, 0, 1, 2]
@@ -421,51 +512,54 @@ class NeuronModelRunner:
         # where K is the max_num_blocks_per_req and the block size is 2.
         # NOTE(woosuk): We can't simply use `token_indices // block_size` here
         # because M (max_model_len) is not necessarily divisible by block_size.
-        block_numbers = self.input_batch.block_table.get_cpu_tensor().flatten(
-        )[req_indices * self.max_num_blocks_per_req +
-          positions_np // self.block_size]
-        block_offsets = torch.from_numpy(positions_np % self.block_size)
-        slot_mapping = torch.empty((total_num_scheduled_tokens, ),
-                                   dtype=torch.int32,
-                                   device="cpu",
-                                   pin_memory=self.pin_memory)
-        torch.add(block_numbers * self.block_size,
-                  block_offsets,
-                  out=slot_mapping)
-
-        _PAD_SLOT_ID = self.num_blocks * self.block_size
-        padded_num_tokens = self._get_padded_batch_size(
-            total_num_scheduled_tokens)
-        slot_mapping_pad_length = padded_num_tokens - slot_mapping.shape[0]
-        slot_mapping = torch.nn.functional.pad(slot_mapping,
-                                               (0, slot_mapping_pad_length),
-                                               'constant', _PAD_SLOT_ID)
+        # req_indices: # E.g., [2, 5, 3] -> [0, 0, 1, 1, 1, 1, 1, 2, 2, 2]
+        block_table_indices = (req_indices * self.max_num_blocks_per_req +
+                               positions_np // self.block_size)
+        # NOTE(woosuk): We use torch.index_select instead of np.take here
+        # because torch.index_select is much faster than np.take for large
+        # tensors.
+        block_table_cpu = self.input_batch.block_table.get_cpu_tensor()
+        block_numbers = block_table_cpu.flatten()[block_table_indices].numpy()
+        block_offsets = positions_np % self.block_size
+        np.add(block_numbers * self.block_size,
+               block_offsets,
+               out=self.slot_mapping_np[:total_num_scheduled_tokens])
 
         # Prepare the attention metadata.
-        query_start_loc = torch.empty((num_reqs + 1, ),
-                                      dtype=torch.int32,
-                                      device="cpu",
-                                      pin_memory=self.pin_memory)
-        query_start_loc_np = query_start_loc.numpy()
-        query_start_loc_np[0] = 0
-        np.cumsum(num_scheduled_tokens, out=query_start_loc_np[1:])
+        self.query_start_loc_np[0] = 0
+        np.cumsum(num_scheduled_tokens_per_req,
+                  out=self.query_start_loc_np[1:num_reqs + 1])
+        self.query_start_loc_np[num_reqs + 1:] = 1
 
-        seq_lens = (self.input_batch.num_computed_tokens_cpu[:num_reqs] +
-                    num_scheduled_tokens)
-        max_seq_len = seq_lens.max()
-        seq_start_loc = torch.empty((num_reqs + 1, ),
-                                    dtype=torch.int32,
-                                    device="cpu",
-                                    pin_memory=self.pin_memory)
-        seq_start_loc_np = seq_start_loc.numpy()
-        seq_start_loc_np[0] = 0
-        np.cumsum(seq_lens, out=seq_start_loc_np[1:])
+        self.seq_lens_np[:num_reqs] = (
+            self.input_batch.num_computed_tokens_cpu[:num_reqs] +
+            num_scheduled_tokens_per_req)
 
-        with torch.inference_mode():
-            self.input_ids[:total_num_scheduled_tokens].copy_(input_ids)
-            self.positions[:total_num_scheduled_tokens].copy_(positions)
+        # Do the padding and copy the tensors to the TPU.
+        padded_total_num_scheduled_tokens = _get_padded_token_len(
+            self.num_tokens_paddings, total_num_scheduled_tokens)
+        # Zero out to avoid spurious values from prev iteration (last cp chunk)
+        self.input_ids_cpu[
+            total_num_scheduled_tokens:padded_total_num_scheduled_tokens] = 0
+        self.input_ids = self.input_ids_cpu[:
+                                            padded_total_num_scheduled_tokens].to(
+                                                self.device)
+        self.position_ids = self.positions_cpu[:
+                                               padded_total_num_scheduled_tokens].to(
+                                                   self.device)
+        self.slot_mapping_cpu[total_num_scheduled_tokens:] = _PAD_SLOT_ID
+        slot_mapping = self.slot_mapping_cpu[:
+                                             padded_total_num_scheduled_tokens].to(
+                                                 self.device)
+        block_tables = self.block_table_cpu[:self.max_num_reqs]
+        block_tables[:num_reqs, :self.max_num_blocks_per_req] = (
+            self.input_batch.block_table.get_cpu_tensor()[:num_reqs])
+        block_tables = block_tables.to(self.device)
+        query_start_loc = self.query_start_loc_cpu[:self.max_num_reqs + 1].to(
+            self.device)
+        seq_lens = self.seq_lens_cpu[:self.max_num_reqs].to(self.device)
 
-        seq_lens = torch.diff(seq_start_loc)
+        # seq_lens = torch.diff(seq_start_loc)
         query_lens = torch.diff(query_start_loc)
         context_lens = seq_lens - query_lens
         num_active_blocks_shifted = shift_bit_length(
@@ -558,54 +652,118 @@ class NeuronModelRunner:
         logits_indices = logits_indices.to(self.device)
         return attn_metadata, logits_indices, padded_num_reqs
 
-    def _execute_encoder(self, scheduler_output: "SchedulerOutput"):
+    def _scatter_placeholders(
+        self,
+        embeds: torch.Tensor,
+        is_embed: Optional[torch.Tensor],
+    ) -> torch.Tensor:
+        if is_embed is None:
+            return embeds
+
+        placeholders = embeds.new_full(
+            (is_embed.shape[0], embeds.shape[-1]),
+            fill_value=torch.nan,
+        )
+        placeholders[is_embed] = embeds
+        return placeholders
+
+    def _gather_placeholders(
+        self,
+        placeholders: torch.Tensor,
+        is_embed: Optional[torch.Tensor],
+    ) -> torch.Tensor:
+        if is_embed is None:
+            return placeholders
+
+        return placeholders[is_embed]
+
+    def _execute_mm_encoder(self, scheduler_output: "SchedulerOutput"):
         scheduled_encoder_inputs = scheduler_output.scheduled_encoder_inputs
         if not scheduled_encoder_inputs:
             return
 
         # Batch the multi-modal inputs.
-        mm_inputs: list[MultiModalKwargs] = []
-        req_input_ids: list[tuple[str, int]] = []
+        mm_inputs = list[MultiModalKwargs]()
+        req_ids_pos = list[tuple[str, int, PlaceholderRange]]()
         for req_id, encoder_input_ids in scheduled_encoder_inputs.items():
             req_state = self.requests[req_id]
-            for input_id in encoder_input_ids:
-                mm_inputs.append(req_state.mm_inputs[input_id])
-                req_input_ids.append((req_id, input_id))
-        batched_mm_inputs = MultiModalKwargs.batch(mm_inputs)
-        batched_mm_inputs = MultiModalKwargs.as_kwargs(batched_mm_inputs,
-                                                       device=self.device)
 
-        # Run the encoder.
-        # `encoder_outputs` is either of the following:
-        # 1. A tensor of shape [num_images, feature_size, hidden_size]
-        # in case when feature_size is fixed across all images.
-        # 2. A list (length: num_images) of tensors, each of shape
-        # [feature_size, hidden_size] in case when the feature size is
-        # dynamic depending on input images.
-        encoder_outputs = self.model.get_multimodal_embeddings(
-            **batched_mm_inputs)
+            for mm_input_id in encoder_input_ids:
+                mm_inputs.append(req_state.mm_inputs[mm_input_id])
+                req_ids_pos.append(
+                    (req_id, mm_input_id, req_state.mm_positions[mm_input_id]))
+
+        # Batch mm inputs as much as we can: if a request in the batch has
+        # multiple modalities or a different modality than the previous one,
+        # we process it separately to preserve item order.
+        # FIXME(ywang96): This is a hacky way to deal with multiple modalities
+        # in the same batch while still being able to benefit from batching
+        # multimodal inputs. The proper solution should be reordering the
+        # encoder outputs.
+        grouped_mm_inputs_list = group_mm_inputs_by_modality(mm_inputs)
+
+        encoder_outputs = []
+        for grouped_mm_inputs in grouped_mm_inputs_list:
+            batched_mm_inputs = MultiModalKwargs.batch(grouped_mm_inputs)
+            batched_mm_inputs = MultiModalKwargs.as_kwargs(batched_mm_inputs,
+                                                           device=self.device)
+
+            # Run the encoder.
+            # `curr_group_outputs` is either of the following:
+            # 1. A tensor of shape (num_items, feature_size, hidden_size)
+            # in case feature_size is fixed across all multimodal items.
+            # 2. A list or tuple (length: num_items) of tensors, each of shape
+            # (feature_size, hidden_size) in case the feature size is dynamic
+            # depending on the input multimodal items.
+            xm.mark_step()
+            curr_group_outputs = self.model.get_multimodal_embeddings(
+                **batched_mm_inputs)
+            xm.mark_step()
+
+            sanity_check_mm_encoder_outputs(
+                curr_group_outputs,
+                expected_num_items=len(grouped_mm_inputs),
+            )
+
+            if isinstance(curr_group_outputs, torch.Tensor):
+                encoder_outputs.append(curr_group_outputs)
+            else:
+                assert isinstance(curr_group_outputs, (list, tuple))
+                for output in curr_group_outputs:
+                    encoder_outputs.append(output)
 
         # Cache the encoder outputs.
-        for (req_id, input_id), output in zip(req_input_ids, encoder_outputs):
+        # NOTE (NickLucche) here we diverge from logic in other runners, as we
+        # assume to only have whole mm items to process. Hence we avoid the
+        # intrinsic dynamism that `scatter_mm_placeholders` introduces.
+        for (req_id, input_id, pos_info), output in zip(
+                req_ids_pos,
+                encoder_outputs,
+        ):
             if req_id not in self.encoder_cache:
                 self.encoder_cache[req_id] = {}
+            assert pos_info.is_embed is None, "Expected all positions to be"\
+                " contiguous and embeddings."
             self.encoder_cache[req_id][input_id] = output
 
-    def _gather_encoder_outputs(
+    def _gather_mm_embeddings(
         self,
         scheduler_output: "SchedulerOutput",
     ) -> list[torch.Tensor]:
-        encoder_outputs: list[torch.Tensor] = []
-        num_reqs = self.input_batch.num_reqs
-        for req_id in self.input_batch.req_ids[:num_reqs]:
+        mm_embeds: list[torch.Tensor] = []
+        for req_id in self.input_batch.req_ids:
             num_scheduled_tokens = scheduler_output.num_scheduled_tokens[
                 req_id]
             req_state = self.requests[req_id]
             num_computed_tokens = req_state.num_computed_tokens
             mm_positions = req_state.mm_positions
+            # TODO unroll loop and assume/enforce --disable_chunked_mm_input
+            # NOTE (NickLucche) here we diverge from logic in other runners, as
+            # we assume to only have whole mm items to process. Hence we avoid
+            # the intrinsic dynamism that `gather_mm_placeholders` introduces.
             for i, pos_info in enumerate(mm_positions):
-                start_pos = pos_info["offset"]
-                num_encoder_tokens = pos_info["length"]
+                start_pos = pos_info.offset
+                num_encoder_tokens = pos_info.length
 
                 # The encoder output is needed if the two ranges overlap:
                 # [num_computed_tokens,
@@ -619,16 +777,32 @@ class NeuronModelRunner:
                     # in the decoder's KV cache.
                     continue
 
-                start_idx = max(num_computed_tokens - start_pos, 0)
-                end_idx = min(
-                    num_computed_tokens - start_pos + num_scheduled_tokens,
-                    num_encoder_tokens)
-                assert start_idx < end_idx
                 assert req_id in self.encoder_cache
                 assert i in self.encoder_cache[req_id]
+                assert pos_info.is_embed is None, "Expected all positions to"\
+                " be contiguous and embeddings."
                 encoder_output = self.encoder_cache[req_id][i]
-                encoder_outputs.append(encoder_output[start_idx:end_idx])
-        return encoder_outputs
+                mm_embeds.append(encoder_output)
+        return mm_embeds
+
+    def _get_model_inputs(self, input_ids: torch.Tensor,
+                          mm_embeds: list[torch.Tensor]):
+        if self.is_multimodal_model:
+            # NOTE(woosuk): To unify token ids and soft tokens (vision
+            # embeddings), we always use embeddings (rather than token ids)
+            # as input to the multimodal model, even when the input is text.
+            if mm_embeds:
+                inputs_embeds = self.model.get_input_embeddings(
+                    input_ids, mm_embeds)
+            else:
+                inputs_embeds = self.model.get_input_embeddings(input_ids)
+            return None, inputs_embeds
+        else:
+            # For text-only models, we use token ids as input.
+            # While it is possible to use embeddings as input just like the
+            # multimodal models, it is not desirable for performance since
+            # then the embedding layer is not included in the CUDA graph.
+            return input_ids, None
 
     @torch.inference_mode()
     def execute_model(
@@ -636,73 +810,48 @@ class NeuronModelRunner:
         scheduler_output: "SchedulerOutput",
         intermediate_tensors: Optional[IntermediateTensors] = None,
     ) -> ModelRunnerOutput:
+        # Update cached state
         self._update_states(scheduler_output)
         if not scheduler_output.total_num_scheduled_tokens:
-            # Return empty ModelRunnerOuptut if there's no work to do.
+            # Return empty ModelRunnerOutput if there's no work to do.
             return EMPTY_MODEL_RUNNER_OUTPUT
 
         if self.is_multimodal_model:
             # Run the multimodal encoder if any.
-            self._execute_encoder(scheduler_output)
-            encoder_outputs = self._gather_encoder_outputs(scheduler_output)
+            self._execute_mm_encoder(scheduler_output)
+            mm_embeds = self._gather_mm_embeddings(scheduler_output)
         else:
-            encoder_outputs = []
-
-        # Prepare the decoder inputs.
+            mm_embeds = []
+        xm.mark_step()
+        # Prepare inputs
         attn_metadata, logits_indices, padded_num_reqs = self._prepare_inputs(
             scheduler_output)
-        num_scheduled_tokens = scheduler_output.total_num_scheduled_tokens
-        num_input_tokens = self._get_padded_batch_size(num_scheduled_tokens)
-
-        attn_metadata.num_input_tokens = num_input_tokens
-
-        if self.is_multimodal_model:
-            # NOTE(woosuk): To unify token ids and soft tokens (vision
-            # embeddings), we always use embeddings (rather than token ids)
-            # as input to the multimodal model, even when the input is text.
-            input_ids = self.input_ids[:num_scheduled_tokens]
-            if encoder_outputs:
-                inputs_embeds = self.model.get_input_embeddings(
-                    input_ids, encoder_outputs)
-            else:
-                inputs_embeds = self.model.get_input_embeddings(input_ids)
-            # TODO(woosuk): Avoid the copy. Optimize.
-            self.inputs_embeds[:num_scheduled_tokens].copy_(inputs_embeds)
-            inputs_embeds = self.inputs_embeds[:num_input_tokens]
-            input_ids = None
-        else:
-            # For text-only models, we use token ids as input.
-            input_ids = self.input_ids[:num_input_tokens]
-            inputs_embeds = None
-        if self.uses_mrope:
-            positions = self.mrope_positions[:, :num_input_tokens]
-        else:
-            positions = self.positions[:num_input_tokens]
-
+        input_ids, inputs_embeds = self._get_model_inputs(
+            self.input_ids, mm_embeds)
+        xm.mark_step()
         num_reqs = self.input_batch.num_reqs
-        # Run the decoder.
+        # Run the decoder
         with set_forward_context(attn_metadata, self.vllm_config):
             hidden_states = self.model(
-                input_ids=input_ids.unsqueeze(0).to(self.device),
-                positions=positions[:num_input_tokens].unsqueeze(0).to(
-                    self.device),
-                intermediate_tensors=None,
-                inputs_embeds=inputs_embeds.to(self.device)
-                if inputs_embeds is not None else None,
-            ).cpu()
-        hidden_states = hidden_states[0, :num_scheduled_tokens]
-        hidden_states = hidden_states[logits_indices.cpu()]
-
-        if hasattr(self.model, "lm_head"):
-            # Compute logits on CPU
-            self.model.lm_head = self.model.lm_head.cpu()
-        logits = self.model.compute_logits(hidden_states, None)
-        sampling_metadata = NeuronSupportedSamplingMetadata.\
+                input_ids=input_ids,
+                positions=self.position_ids,
+                inputs_embeds=inputs_embeds,
+            )
+        hidden_states = self.select_hidden_states(hidden_states,
+                                                  logits_indices)
+        logits = self.compute_logits(hidden_states)
+        neuron_sampling_metadata = NeuronSupportedSamplingMetadata.\
             from_input_batch(self.input_batch, padded_num_reqs, self.device)
-        selected_token_ids = self.sample_from_logits(logits, sampling_metadata)
+        if scheduler_output.grammar_bitmask is not None:
+            require_struct_decoding, grammar_bitmask_padded, arange = \
+                self.prepare_structured_decoding_input(logits, scheduler_output)
+            logits = self.structured_decode(require_struct_decoding,
+                                            grammar_bitmask_padded, logits,
+                                            arange)
+        selected_token_ids = self.sample_from_logits(logits,
+                                                     neuron_sampling_metadata)
         # Remove padding on cpu and keep dynamic op outside of xla graph.
         selected_token_ids = selected_token_ids.cpu()[:num_reqs]
-        print(f"{selected_token_ids=}, {num_reqs=}")
 
         # Update the cache state concurrently. Code above will not block until
         # we use `selected_token_ids`. Add mark_step if post-processing changes
@@ -730,13 +879,12 @@ class NeuronModelRunner:
         assert all(
             req_id is not None for req_id in
             self.input_batch.req_ids[:num_reqs]), "req_ids contains None"
+        req_ids = cast(list[str], self.input_batch.req_ids[:num_reqs])
 
-        # Compute prompt logprobs if needed.
         prompt_logprobs_dict: dict[str, Optional[LogprobsTensors]] = {}
         for req_id in self.input_batch.req_ids[:num_reqs]:
             prompt_logprobs_dict[req_id] = None
 
-        # Get the valid generated tokens.
         max_gen_len = selected_token_ids.shape[-1]
         if max_gen_len == 1:
             valid_sampled_token_ids = selected_token_ids.tolist()
@@ -769,13 +917,18 @@ class NeuronModelRunner:
                 req_state.output_token_ids.extend(valid_sampled_token_ids[i])
 
         model_runner_output = ModelRunnerOutput(
-            req_ids=self.input_batch.req_ids,
+            req_ids=req_ids,
             req_id_to_index=self.input_batch.req_id_to_index,
             sampled_token_ids=valid_sampled_token_ids,
             spec_token_ids=None,
             logprobs=None,
             prompt_logprobs_dict=prompt_logprobs_dict,
         )
+
+        # Check there are no new graphs compiled - all the graphs should be
+        # captured and compiled during warm up.
+        self._verify_num_xla_graphs("execute_model")
+
         return model_runner_output
 
     def load_model(self) -> None:
@@ -787,14 +940,12 @@ class NeuronModelRunner:
             model = model.eval().to(self.device)
             xm.mark_step()
             xm.wait_device_ops()
-            self.model = torch.compile(model,
-                                       backend="openxla",
-                                       fullgraph=True,
-                                       dynamic=False)
+            self.model = torch.compile(
+                model, backend="openxla", fullgraph=True, dynamic=False)
             self.sampler = NeuronSampler()
 
     @torch.inference_mode()
-    def _dummy_run(self, kv_caches, num_tokens: int) -> torch.Tensor:
+    def _dummy_run(self, num_tokens: int) -> None:
         num_active_blocks_shifted = shift_bit_length(
             (self.block_size - 1) // self.block_size)
         num_active_blocks_factor = (LARGE_TILE_SZ // self.block_size //
@@ -847,34 +998,123 @@ class NeuronModelRunner:
             input_ids = None
             inputs_embeds = self.inputs_embeds[:num_tokens]
         else:
-            input_ids = self.input_ids[:num_tokens]
+            input_ids = self.input_ids_cpu[:num_tokens]
             inputs_embeds = None
         with set_forward_context(attn_metadata, self.vllm_config):
             hidden_states = self.model(
                 input_ids=input_ids.unsqueeze(0).to(self.device)
                 if input_ids is not None else None,
-                positions=self.positions[:num_tokens].unsqueeze(0).to(
+                positions=self.positions_cpu[:num_tokens].unsqueeze(0).to(
                     self.device),
                 inputs_embeds=inputs_embeds.to(self.device)
                 if inputs_embeds is not None else None,
             )
         return hidden_states
 
-    def profile_run(self) -> None:
-        num_tokens = max(self.neuron_compilation_batch_sizes)
-        self._dummy_run(self.kv_caches, num_tokens)
+    def _precompile_backbone(self) -> None:
+        logger.info("Compiling the model with different input shapes.")
+        start = time.perf_counter()
+        for num_tokens in self.num_tokens_paddings:
+            logger.info("  -- num_tokens: %d", num_tokens)
+            self._dummy_run(num_tokens)
+        xm.wait_device_ops()
+        end = time.perf_counter()
+        logger.info("Compilation finished in %.2f [secs].", end - start)
+        self._update_num_xla_graphs("model backbone")
+
+    def _precompile_select_hidden_states(self) -> None:
+        # Compile hidden state selection function for bucketed
+        # n_tokens x max_num_reqs. Graph is really small so this is fine.
+        logger.info(
+            "Compiling select_hidden_states with different input shapes.")
+        start = time.perf_counter()
+        hsize = self.model_config.get_hidden_size()
+        for num_tokens in self.num_tokens_paddings:
+            dummy_hidden = torch.zeros((num_tokens, hsize),
+                                       device=self.device,
+                                       dtype=self._hidden_states_dtype)
+            torch._dynamo.mark_dynamic(dummy_hidden, 0)
+            for num_reqs in self.num_reqs_paddings:
+                indices = torch.zeros(num_reqs,
+                                      dtype=torch.int32,
+                                      device=self.device)
+                torch._dynamo.mark_dynamic(indices, 0)
+                self.select_hidden_states(dummy_hidden, indices)
+                logger.info("  -- num_tokens: %d, num_seqs: %d", num_tokens,
+                            num_reqs)
+                # Requests can't be more than tokens. But do compile for the
+                # next bigger value in case num_tokens uses bucketed padding.
+                if num_reqs >= min(num_tokens, self.max_num_reqs):
+                    break
+        xm.wait_device_ops()
+        end = time.perf_counter()
+        logger.info("Compilation finished in %.2f [secs].", end - start)
+        self._update_num_xla_graphs("select_hidden_states")
+
+    def _precompile_compute_logits(self) -> None:
+        logger.info("Compiling compute_logits with different input shapes.")
+        start = time.perf_counter()
+        hsize = self.model_config.get_hidden_size()
+        for num_reqs in self.num_reqs_paddings:
+            dummy_hidden = torch.zeros((num_reqs, hsize),
+                                       device=self.device,
+                                       dtype=self._hidden_states_dtype)
+            torch._dynamo.mark_dynamic(dummy_hidden, 0)
+            self.compute_logits(dummy_hidden)
+            logger.info("  -- num_seqs: %d", num_reqs)
+        xm.wait_device_ops()
+        end = time.perf_counter()
+        logger.info("Compilation finished in %.2f [secs].", end - start)
+        self._update_num_xla_graphs("compute_logits")
+
+    def _precompile_sample_from_logits(self) -> None:
+        logger.info(
+            "Compiling sample_from_logits with different input shapes.")
+        start = time.perf_counter()
+        for num_reqs in self.num_reqs_paddings:
+            dummy_logits = torch.zeros((num_reqs, self.vocab_size),
+                                       device=self.device,
+                                       dtype=self._hidden_states_dtype)
+            # The first dimension of dummy_logits cannot be mark_dynamic
+            # because some operations in the sampler require it to be static.
+            for all_greedy in [True]:
+                generate_params_if_all_greedy = not all_greedy
+                sampling_metadata = (
+                    NeuronSupportedSamplingMetadata.from_input_batch(
+                        self.input_batch,
+                        num_reqs,
+                        self.device,
+                        generate_params_if_all_greedy,
+                    ))
+                sampling_metadata.all_greedy = all_greedy
+                self.sample_from_logits(dummy_logits, sampling_metadata)
+            logger.info("  -- num_seqs: %d", num_reqs)
+        xm.wait_device_ops()
+        end = time.perf_counter()
+        logger.info("Compilation finished in %.2f [secs].", end - start)
+        self._update_num_xla_graphs("sample_from_logits")
 
     def capture_model(self) -> None:
+        """
+        Precompile all the subgraphs with possible input shapes.
+        """
+        self._precompile_backbone()
+        self._precompile_select_hidden_states()
+        self._precompile_compute_logits()
+        # self._precompile_sample_from_logits()
 
-        start_time = time.perf_counter()
+    def profile_run(
+        self,
+        num_tokens: int,
+    ) -> None:
 
-        # Trigger Neuron compilation for specific shapes
-        for num_tokens in reversed(self.neuron_compilation_batch_sizes):
-            self._dummy_run(self.kv_caches, num_tokens)
+        # Trigger compilation for general shape.
+        self._dummy_run(num_tokens)
 
-        end_time = time.perf_counter()
-        elapsed_time = end_time - start_time
-        logger.info("Neuron compilation finished in %.0f secs", elapsed_time)
+        xm.mark_step()
+        xm.wait_device_ops()
+        self.encoder_cache.clear()
+        gc.collect()
 
     def initialize_kv_cache(self, kv_cache_config: KVCacheConfig) -> None:
         """
@@ -883,8 +1123,6 @@ class NeuronModelRunner:
             kv_cache_config: Configuration for the KV cache, including the KV
             cache size of each layer
         """
-        assert len(self.kv_caches) == 0
-        self.num_blocks = kv_cache_config.num_blocks
         if len(kv_cache_config.kv_cache_groups) > 1:
             raise NotImplementedError(
                 "Hybrid models with more than one KV cache type are not "
@@ -897,9 +1135,10 @@ class NeuronModelRunner:
             for layer_name in kv_cache_group.layer_names:
                 tensor_config = kv_cache_config.tensors[layer_name]
                 assert tensor_config.size % kv_cache_spec.page_size_bytes == 0
-                if isinstance(kv_cache_spec, FullAttentionSpec):
+                num_blocks = tensor_config.size // kv_cache_spec.page_size_bytes
+                if isinstance(kv_cache_spec, AttentionSpec):
                     kv_cache_shape = NeuronAttentionBackend.get_kv_cache_shape(
-                        self.num_blocks + 1, self.block_size,
+                        num_blocks, kv_cache_spec.block_size,
                         kv_cache_spec.num_kv_heads, kv_cache_spec.head_size)
                     dtype = kv_cache_spec.dtype
 
@@ -916,11 +1155,30 @@ class NeuronModelRunner:
             self.vllm_config.compilation_config.static_forward_context,
             self.kv_caches)
 
+    def reset_dynamo_cache(self):
+        if self.is_multimodal_model:
+            compiled_model = self.model.get_language_model().model
+        else:
+            compiled_model = self.model.model
+        if isinstance(compiled_model, TorchCompileWrapperWithCustomDispatcher):
+            logger.info("Clear dynamo cache and cached dynamo bytecode.")
+            torch._dynamo.eval_frame.remove_from_cache(
+                compiled_model.original_code_object)
+            compiled_model.compiled_codes.clear()
+
+    @torch.compile(backend="openxla", fullgraph=True, dynamic=False)
+    def select_hidden_states(self, hidden_states, indices_do_sample):
+        return hidden_states[indices_do_sample]
+
+    @torch.compile(backend="openxla", fullgraph=True, dynamic=False)
+    def compute_logits(self,
+                       sample_hidden_states: torch.Tensor) -> torch.Tensor:
+        return self.model.compute_logits(sample_hidden_states, None)
+
     @torch.compile(backend="openxla", fullgraph=True, dynamic=False)
     def sample_from_logits(
             self, logits: torch.Tensor,
-            sampling_metadata: NeuronSupportedSamplingMetadata
-    ) -> torch.Tensor:
+            sampling_metadata: NeuronSupportedSamplingMetadata) -> torch.Tensor:
         if sampling_metadata.all_greedy:
             out_tokens = torch.argmax(logits, dim=-1, keepdim=True)
         else:
@@ -939,37 +1197,10 @@ class NeuronModelRunner:
                 return padded_size
         return None
 
-    def get_model(self) -> nn.Module:
-        assert self.model is not None
-        return self.model
 
-    def get_kv_cache_spec(self) -> dict[str, KVCacheSpec]:
-        """
-        Generates the KVCacheSpec by parsing the kv cache format from each 
-        Attention module in the static forward context.
-        Returns:
-            KVCacheSpec: A dictionary mapping layer names to their KV cache 
-            format. Layers that do not need KV cache are not included.
-        """
 
-        forward_ctx = self.vllm_config.compilation_config.static_forward_context
-        block_size = self.vllm_config.cache_config.block_size
-        kv_cache_spec: dict[str, KVCacheSpec] = {}
-        for layer_name, attn_module in forward_ctx.items():
-            # TODO: Support other attention modules, e.g., sliding window,
-            # cross-attention, MLA.
-            assert isinstance(attn_module, Attention)
-            if attn_module.attn_type == AttentionType.DECODER:
-                kv_cache_spec[layer_name] = FullAttentionSpec(
-                    block_size=block_size,
-                    num_kv_heads=attn_module.num_kv_heads,
-                    head_size=attn_module.head_size,
-                    dtype=attn_module.dtype,
-                    use_mla=False,
-                )
-            else:
-                raise NotImplementedError
-        return kv_cache_spec
+def shift_bit_length(x):
+    return 1 << (x - 1).bit_length()
 
 
 def get_active_block_tables(block_tables, query_lens, seq_lens, block_size,

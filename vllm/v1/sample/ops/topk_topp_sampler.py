@@ -119,6 +119,17 @@ class TopKTopPSampler(nn.Module):
         probs = logits.softmax(dim=-1, dtype=torch.float32)
         return random_sample(probs, generators)
 
+    def forward_neuron(
+        self,
+        logits: torch.Tensor,
+        generators: dict[int, torch.Generator],
+        k: Optional[torch.Tensor],
+        p: Optional[torch.Tensor],
+    ) -> torch.Tensor:
+        logits = apply_top_k_top_p_tpu(logits, k, p)
+        probs = logits.softmax(dim=-1, dtype=torch.float32)
+        return random_sample(probs, generators)
+
 
 def apply_top_k_top_p_tpu(
     logits: torch.Tensor,

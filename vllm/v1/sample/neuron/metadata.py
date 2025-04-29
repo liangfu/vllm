@@ -91,6 +91,7 @@ class NeuronSupportedSamplingMetadata:
 
         num_reqs = input_batch.num_reqs
 
+        @torch.inference_mode
         def fill_slice(cpu_tensor: torch.Tensor, fill_val) -> torch.Tensor:
             # Pad value is the default one.
             cpu_tensor[num_reqs:padded_num_reqs] = fill_val
