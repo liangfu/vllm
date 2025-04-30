@@ -413,11 +413,250 @@ def load_v_tile(v_hbm_tile, cur_v_tile, large_tile_idx, v_i, LARGE_TILE_SZ):
 
 
 @nki.jit
+def build_attention_mask(
+    prior_mask,
+    cu_query_lens,
+    cu_ctx_lens,
+    seq_lens,
+    max_num_queries,
+    max_num_keys,
+    max_num_seqs,
+    block_size,
+    tiled_block_size,
+    contexted=False,
+):
+    """
+    Creates block diagonal causal masks for multiple prompts.
+
+    This mask is dynamic and depends on the input prompt lengths.
+
+    Example:
+        query_lens = [2, 3, 1, 0], key_lens = [4, 5, 4, 0], max_num_queries = 8, max_num_keys = 16, max_num_seqs = 4
+
+        prior_mask = [
+        #   i0, 1, 2, 3, 4, 5, 6, 7, 8, 9,10,11,12,13,14,15,16,17,18,19
+        #   c0,c0,c0,n0,c1,c1,c1,n1,n1,p1,p1,p1,c2,c2,c2,c2,p3,p3,p3,p3 - (c - cached token, n - new token, p - padding)
+            [1, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], # sequence 0 (4 tokens, aligned to 1 block)
+            [1, 1, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], # sequence 0 (4 tokens, aligned to 1 block)
+            [0, 0, 0, 0, 1, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], # sequence 1 (5 tokens, aligned to 2 blocks)
+            [0, 0, 0, 0, 1, 1, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], # sequence 1 (5 tokens, aligned to 2 blocks)
+            [0, 0, 0, 0, 1, 1, 1, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], # sequence 1 (5 tokens, aligned to 2 blocks)
+            [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 0, 0, 0, 0], # sequence 2 (4 tokens, aligned to 1 block)
+            [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], # padding
+            [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], # padding
+        ]
+        active_mask = None
+
+    Args:
+        prompt_lens: The list of prompt lengths.
+        n_positions: The total size of the KV cache to consider. This is
+            equal to the current bucket size.
+
+    Returns:
+        prior_mask: The attention mask to apply to the KV cache.
+        active_mask: The attention mask to apply to the active tokens (None).
+
+    For each sequence, we start from building a triangle mask with an offset.
+    As shown in the following figure, with
+
+      ri = q_cumsum[seq_id]
+      ci = k_cumsum[seq_id] (k_cumsum need to be block-aligned)
+      nr = query_lens[seq_id]
+      nc = key_lens[seq_id]
+
+    we can trim the triangle mask from different directions, in order to get the desired shape.
+
+                 (0, ci+nc-ri-nr)
+    +--------------------+----------------------------------+
+    |                      \                                |
+    |                        \   (ri, ci+nc-nr)             |
+    |                          \   |                        |
+    |   (ri, ci)                 \       (ri, ci+nc)        |
+    |       +----------------------+ - - - +                |
+    |       | xxxxxxxxxxxxxxxxxxxxxx \     |                |
+    |       | xxxxxxxxxxxxxxxxxxxxxxxx \   |                |
+    |       | xxxxxxxxxxxxxxxxxxxxxxxxxx \ |                |
+    |       +------------------------------+                |
+    |   (ri+nr, ci)                      (ri+nr, ci+nc)     |
+    |                                                       |
+    +-------------------------------------------------------+
+    """
+
+    print(f"{cu_query_lens.shape=}")
+    i_p = nl.arange(1)[:, None]
+    cu_f = nl.arange(max_num_seqs + 1)[None, :]
+    i_f = nl.arange(max_num_seqs)[None, :]
+    cu_query_lens_sbuf = nl.load(cu_query_lens[cu_f])
+    cu_ctx_lens_sbuf = nl.load(cu_ctx_lens[cu_f])
+    seq_lens_sbuf = seq_lens
+    print(
+        f"{cu_query_lens_sbuf.shape=}, {max_num_queries=}, {max_num_keys=}, {max_num_seqs=}, {block_size=}"
+    )
+    query_lens = cu_query_lens_sbuf[i_p, i_f + 1] - cu_query_lens_sbuf[i_p,
+                                                                       i_f]
+    ctx_lens = seq_lens_sbuf
+
+    assert (int(cu_query_lens_sbuf.shape[1]) == max_num_seqs + 1) and (int(
+        cu_query_lens_sbuf.ndim) == 2), f"invalid {cu_query_lens=}"
+    assert (int(cu_ctx_lens_sbuf.shape[1]) == max_num_seqs + 1) and (int(
+        cu_ctx_lens_sbuf.ndim) == 2), f"invalid {cu_ctx_lens=}"
+    assert (int(query_lens.shape[1]) == max_num_seqs) and (int(
+        query_lens.ndim) == 2), f"invalid {query_lens=}"
+    assert (int(seq_lens_sbuf.shape[1]) == max_num_seqs) and (int(
+        seq_lens_sbuf.ndim) == 2), f"invalid {seq_lens=}"
+
+    # Create mask buffers
+    # prior_mask = nl.ndarray((1, max_num_queries, max_num_keys), dtype=nl.bool_, buffer=nl.shared_hbm)
+
+    q_tile_size, k_tile_size = max_num_queries, max_num_keys  # max_num_queries, 8
+    n_q_tile = (max_num_queries + q_tile_size - 1) // q_tile_size
+    n_k_tile = (max_num_keys + k_tile_size - 1) // k_tile_size
+    print(f"{n_q_tile=}, {n_k_tile=}")
+    i_p = nl.arange(q_tile_size)[:, None]  # this works for dynamic access
+    i_f = nl.arange(k_tile_size)[None, :]
+
+    def _br(x, out):
+        # Broadcast weight along first axis to match tensor shape
+        for j in range(4):
+            out[j*32:(j+1)*32, :] = nl.broadcast_to(x, shape=(32, k_tile_size))
+    def _br2(x):
+        return nl.broadcast_to(x, shape=(q_tile_size, k_tile_size))
+
+    # a = nl.ndarray((q_tile_size, k_tile_size), buffer=nl.sbuf, dtype=nl.int32)
+    b = nl.ndarray((q_tile_size, k_tile_size), buffer=nl.sbuf, dtype=nl.int32)
+    # expr_a = nl.arange(0, k_tile_size)[None, :]
+    expr_a = nl.arange(0, q_tile_size)[:, None]
+    a_tile = nisa.iota(expr_a, dtype=nl.int32)
+    a = _br2(a_tile)
+    # expr_b = nl.arange(0, q_tile_size)[:, None]
+    expr_b = nl.arange(0, k_tile_size)[None, :]
+    b_tile = nisa.iota(expr_b, dtype=nl.int32)
+    _br(b_tile, b)
+    print(f"{a.shape=}, {b.shape=}, {a_tile.shape=}, {b_tile.shape=}")
+
+    # iota_hbm = nl.ndarray((2, q_tile_size, k_tile_size), dtype=nl.int32, buffer=nl.shared_hbm)
+    # new_mask_hbm = nl.ndarray((max_num_seqs, n_k_tile, q_tile_size, k_tile_size), dtype=nl.int32, buffer=nl.shared_hbm)
+    # loop_var = nl.ndarray((max_num_seqs, n_k_tile, 10), dtype=nl.int32, buffer=nl.shared_hbm)
+
+    # initialize with zero
+    for k_tile_idx in nl.sequential_range(n_k_tile):
+        q_tile_idx = 0
+        q_slice = nl.ds(q_tile_idx * q_tile_size, q_tile_size)
+        k_slice = nl.ds(k_tile_idx * k_tile_size, k_tile_size)
+        q_bound = (q_tile_idx * q_tile_size + i_p) < max_num_queries
+        k_bound = (k_tile_idx * k_tile_size + i_f) < max_num_keys
+        nl.store(prior_mask[q_slice, k_slice],
+                 value=0,
+                 mask=q_bound & k_bound)
+
+    ri = nl.ndarray((q_tile_size, k_tile_size), buffer=nl.sbuf, dtype=nl.int32)
+    ci = nl.ndarray((q_tile_size, k_tile_size), buffer=nl.sbuf, dtype=nl.int32)
+    nr = nl.ndarray((q_tile_size, k_tile_size), buffer=nl.sbuf, dtype=nl.int32)
+    nc = nl.ndarray((q_tile_size, k_tile_size), buffer=nl.sbuf, dtype=nl.int32)
+    tile_offset = nl.ndarray((q_tile_size, k_tile_size), buffer=nl.sbuf, dtype=nl.int32)
+
+    # Process each sequence
+    for seq_idx in nl.sequential_range(max_num_seqs):
+        # ri = _br(cu_query_lens_sbuf[0, seq_idx])
+        # ci = _br(cu_ctx_lens_sbuf[0, seq_idx])
+        # nr = _br(query_lens[0, seq_idx])
+        # nc = _br(ctx_lens[0, seq_idx])
+        _br(cu_query_lens_sbuf[0, seq_idx], ri)
+        _br(cu_ctx_lens_sbuf[0, seq_idx], ci)
+        _br(query_lens[0, seq_idx], nr)
+        _br(ctx_lens[0, seq_idx], nc)
+        print(f"{ci.shape=}, {nc.shape=}, {ri.shape=}, {nr.shape=}")
+
+        for k_tile_idx in nl.sequential_range(n_k_tile):
+            q_tile_idx = 0
+            _br(b_tile[0, k_tile_idx] * k_tile_size, tile_offset)
+
+            if contexted:
+                a_offset = (ci + nc) - (ri + nr)
+                # new_mask = nl.greater_equal(a + a_offset - tile_offset, b)
+                new_mask = nl.greater_equal(nl.subtract(a + a_offset, tile_offset), b)
+            else:
+                new_mask = nl.greater_equal(nl.subtract(ci + nc - 1, tile_offset), b)
+
+            # nl.store(new_mask_hbm[seq_idx, k_tile_idx, :, :], new_mask)
+
+            left_mask = nl.greater_equal(b, ci - tile_offset)
+            top_mask = nl.greater_equal(a, ri)
+            bottom_mask = nl.less(a, ri + nr)
+            new_mask = new_mask & left_mask & top_mask & bottom_mask
+
+            q_slice = nl.ds(q_tile_idx * q_tile_size, q_tile_size)
+            k_slice = nl.ds(k_tile_idx * k_tile_size, k_tile_size)
+            q_bound = (q_tile_idx * q_tile_size + i_p) < max_num_queries
+            k_bound = (k_tile_idx * k_tile_size + i_f) < max_num_keys
+
+            new_mask = nl.load(prior_mask[q_slice, k_slice],
+                               mask=q_bound & k_bound) | new_mask[i_p, i_f]
+            nl.store(prior_mask[q_slice, k_slice],
+                     new_mask[i_p, i_f],
+                     mask=q_bound & k_bound)
+
+        # nl.store(loop_var[seq_idx, k_tile_idx, 0], ri[0, 0])
+        # nl.store(loop_var[seq_idx, k_tile_idx, 1], ci[0, 0])
+        # nl.store(loop_var[seq_idx, k_tile_idx, 2], nr[0, 0])
+        # nl.store(loop_var[seq_idx, k_tile_idx, 3], nc[0, 0])
+        # nl.store(loop_var[seq_idx, k_tile_idx, 4], tile_offset[0, 0])
+        # nl.store(loop_var[seq_idx, k_tile_idx, 5], a_offset[0, 0])
+
+
+    # only reorder cached token mask
+    # if not contexted:
+    #     transpose_kv_token_mask(prior_mask, tiled_block_size)
+
+    # nl.store(iota_hbm[0, :, :], a)
+    # nl.store(iota_hbm[1, :, :], b)
+
+    # return prior_mask, iota_hbm, new_mask_hbm, loop_var
+    return prior_mask
+
+@nki.jit
+def transpose_kv_token_mask(mask, tiled_block_size):
+    """
+    from
+    (total_query_len, context_kv_len // LARGE_TILE_SZ, num_tiled_blocks // B_P_SIZE, B_P_SIZE, tiled_block_size)
+    to
+    (total_query_len, context_kv_len // LARGE_TILE_SZ, num_tiled_blocks // B_P_SIZE, tiled_block_size, B_P_SIZE)
+    """
+    size_q, size_kv = mask.shape
+    assert size_kv % tiled_block_size == 0
+    num_block = size_kv // tiled_block_size
+    B_P_SIZE = 128
+    assert num_block >= B_P_SIZE
+    num_batch = num_block // B_P_SIZE
+    print(f"{size_q=}, {num_batch=}, {B_P_SIZE=}, {tiled_block_size=}")
+    transpose_range = B_P_SIZE * tiled_block_size
+    new_mask_shape1 = (
+        size_q*num_batch, B_P_SIZE, tiled_block_size
+    )
+    new_mask_shape2 = (
+        size_q*num_batch, tiled_block_size, B_P_SIZE
+    )
+    mask_re = mask.reshape(new_mask_shape1)
+    mask_out = mask.reshape(new_mask_shape2)
+    i_p_src, i_f_src = nl.mgrid[0:B_P_SIZE, 0:tiled_block_size]
+    i_p_dst, i_f_dst = nl.mgrid[0:tiled_block_size, 0:B_P_SIZE]
+    for q_idx in nl.sequential_range(size_q):
+        tile = nl.load(mask_re[q_idx, i_p_src, i_f_src])
+        transposed = nl.transpose(tile)
+        print(f"{transposed.shape=}")
+        nl.store(mask_out[q_idx, i_p_dst, i_f_dst], value=transposed)
+
+
+@nki.jit
 def flash_paged_attention(
     query,
     key,
     value,
     kv_cache,
+    cu_seqlens_q,
+    cu_seqlens_k,
+    seqused_k,
+    num_seqs,
     block_tables,
     mask,
     softmax_scale=None,
@@ -446,7 +685,7 @@ def flash_paged_attention(
     IO tensor dtypes:
       - This kernel assumes all IO tensors have the same dtype except for
         block_tables (int32) and mask (int32)
-      - If mixed_precision is True, then all Tensor Engine operation will be
+      - If mixed_percision is True, then all Tensor Engine operation will be
         performed in bfloat16 and accumulation will be performed in float32.
         Otherwise the intermediates will be in the same type as the inputs.
 
@@ -467,12 +706,13 @@ def flash_paged_attention(
       GQA: q: [b, h, d, s], k: [b, kv_h, d, s], v: [b, kv_h, s, d]
         usage: `flash_fwd[b, kv_h](q, k, v, ...)`
     """
+
     B_F_SIZE = 512
     B_P_SIZE = 128
     b, h, d, seqlen_q = query.shape
     B_D_SIZE = d
     n_tile_q = seqlen_q // B_P_SIZE  # since q will be loaded on tensor engine
-    assert n_tile_q >= 1, f"{seqlen_q=} is expected to be multiple of {B_P_SIZE=}"
+    assert n_tile_q >= 1, f"at least 1 query-tile is required: {seqlen_q} vs {B_P_SIZE}"
     _, num_blocks, k_h, block_size, _ = kv_cache.shape
     q_h_per_k_h = h // k_h
     assert b == 1, f"invalid batch size {b=}"
@@ -567,6 +807,7 @@ def flash_paged_attention(
     else:
         block_size_tiling_factor = 1
     tiled_block_size = block_size // block_size_tiling_factor
+    print(f"{tiled_block_size=}, {block_size=}, {block_size_tiling_factor=}")
 
     # Indirect DMA load must be placed along Partition Dimension
     block_tables_sbuf = transform_block_tables_for_indirect_load(
@@ -576,7 +817,7 @@ def flash_paged_attention(
         head_id=head_id,
     )
 
-    # Flatten KV cache to be 3D for loading into SBUF
+    # Flatten KV cache to be 2D for loading into SBUF
     new_cache_shape = (
         2,
         num_blocks * k_h * block_size_tiling_factor,
@@ -603,6 +844,40 @@ def flash_paged_attention(
         buffer=nl.sbuf,
         lazy_initialization=True,
     )
+
+    max_num_seqs = num_seqs # cu_seqlens_q.shape[0] - 1
+
+    prior_mask = nl.ndarray((max_seqlen_q, max_seqlen_k),
+                            dtype=nl.bool_,
+                            buffer=nl.private_hbm)
+    active_mask = nl.ndarray((max_seqlen_q, max_seqlen_q),
+                             dtype=nl.bool_,
+                             buffer=nl.private_hbm)
+    mask_output = nl.ndarray((k_h, num_large_k_tile, B_P_SIZE, LARGE_TILE_SZ), buffer=nl.shared_hbm, dtype=nl.bool_)
+    print(f"{num_large_k_tile=}, {n_tile_q=}, {B_P_SIZE=}, {LARGE_TILE_SZ=}")
+
+    i_p = nl.arange(1)[:, None]
+    i_f = nl.arange(max_num_seqs)[None, :]
+    seqused_k_sbuf = nl.load(seqused_k[i_f])
+    build_attention_mask(prior_mask,
+                         cu_seqlens_q,
+                         cu_seqlens_k,
+                         seqused_k_sbuf,
+                         max_seqlen_q,
+                         max_seqlen_k,
+                         max_num_seqs=max_num_seqs,
+                         block_size=block_size,
+                         tiled_block_size=tiled_block_size,
+    )
+
+    for large_k_tile_idx in nl.sequential_range(0, num_large_k_tile):
+        cur_mask = nl.load(prior_mask[
+            nl.ds(0, B_P_SIZE),
+            nl.ds(large_k_tile_idx * LARGE_TILE_SZ, LARGE_TILE_SZ),
+        ])
+        # if tiled_block_size > 1:
+        #     cur_mask = transpose_kv_token_mask(cur_mask, tiled_block_size)
+        nl.store(mask_output[head_id, large_k_tile_idx, :, :], cur_mask[:, :])
 
     for large_k_tile_idx in nl.sequential_range(0, num_large_k_tile):
         num_loads = ceil_div(num_blocks_per_large_tile, B_P_SIZE)
@@ -631,6 +906,13 @@ def flash_paged_attention(
                 nl.ds(i * B_P_SIZE, B_P_SIZE),
                 nl.ds(large_k_tile_idx * LARGE_TILE_SZ, LARGE_TILE_SZ),
             ])
+            # cur_mask = nl.load(prior_mask[
+            #     nl.ds(i * B_P_SIZE, B_P_SIZE),
+            #     nl.ds(large_k_tile_idx * LARGE_TILE_SZ, LARGE_TILE_SZ),
+            # ])
+            # if tiled_block_size > 1:
+            #     cur_mask = transpose_kv_token_mask(cur_mask, tiled_block_size)
+            # nl.store(mask_output[large_k_tile_idx, i, :, :], cur_mask[:, :])
             for i_q_h in nl.affine_range(q_h_per_k_h):
                 q_tile = nl.ndarray((B_D_SIZE, B_P_SIZE), dtype=kernel_dtype)
                 q_hbm_tile = query[batch_id, head_id * q_h_per_k_h + i_q_h]
@@ -660,6 +942,24 @@ def flash_paged_attention(
                     B_D_SIZE=B_D_SIZE,
                 )
 
+    i_p = nl.arange(1)[:, None]
+    cu_f = nl.arange(max_num_seqs + 1)[None, :]
+    i_f = nl.arange(max_num_seqs)[None, :]
+    cu_seqlens_q_sbuf = nl.load(cu_seqlens_q[cu_f])
+    seqused_q = cu_seqlens_q_sbuf[i_p, i_f + 1] - cu_seqlens_q_sbuf[i_p, i_f]
+    build_attention_mask(active_mask,
+                         cu_seqlens_q,
+                         cu_seqlens_q,
+                         seqused_q,
+                         max_seqlen_q,
+                         max_seqlen_q,
+                         max_num_seqs=max_num_seqs,
+                         block_size=block_size,
+                         tiled_block_size=tiled_block_size,
+                         contexted=True
+    )
+    # cu_query_lens, cu_query_lens, query_lens, max_query_lens, max_query_lens, max_num_seqs, block_size, contexted=True)
+
     # compute attention between input query, key and value
     if key is not None and value is not None:
         B_F_SIZE = min(seqlen_q, B_F_SIZE)
@@ -688,9 +988,13 @@ def flash_paged_attention(
             )
 
         for i in nl.affine_range(n_tile_q):
-            cur_mask = nl.load(mask[
+            # cur_mask = nl.load(mask[
+            #     nl.ds(i * B_P_SIZE, B_P_SIZE),
+            #     nl.ds(context_kv_len, LARGE_TILE_SZ),
+            # ])
+            cur_mask = nl.load(active_mask[
                 nl.ds(i * B_P_SIZE, B_P_SIZE),
-                nl.ds(context_kv_len, LARGE_TILE_SZ),
+                nl.ds(0, LARGE_TILE_SZ),
             ])
             for i_q_h in nl.affine_range(q_h_per_k_h):
 
@@ -812,13 +1116,20 @@ def reorder_context_mask(mask, LARGE_TILE_SZ, block_size):
         return mask
 
 
-def flash_attn_varlen_nkifunc(
+def flash_attn_varlen_func(
     query,
     key,
     value,
     kv_cache,
+
+    cu_seqlens_q,
+    cu_seqlens_k,
+    seqused_k,
+    # max_seqlen_q,
+    # max_seqlen_k,
+    num_seqs,
+
     block_table,
-    attn_mask,
     n_kv_head=None,
     head_size=None,
     LARGE_TILE_SZ=2048,
@@ -834,13 +1145,14 @@ def flash_attn_varlen_nkifunc(
       - value: (1, n_kv_heads, seq_v, d)
       - kv_cache:   (2, n_blocks, n_kv_heads, block_size, d)
       - block_tables: (n_active_blocks, )
-      - attn_mask: (seq_q, n_active_blocks * block_size + seq_q)
 
     Notes:
-      - attn_mask must be reordered outside using `reorder_context_mask`
       - Key/value cache layout must be (n_blocks, n_kv_heads, block_size, d) 
         for better DMA throughput
     """
+    N, _, n_kv_head, _, head_size = kv_cache.shape
+    assert N == 2, f"invalid {kv_cache.shape=}"
+
     if n_kv_head is None:
         n_kv_head = kv_cache.shape[2]
     assert kv_cache.shape[0] == 2
@@ -848,19 +1160,23 @@ def flash_attn_varlen_nkifunc(
     if head_size is None:
         head_size = kv_cache.shape[-1]
 
-    kwargs = dict(
+    o = flash_paged_attention[1, n_kv_head](
         query=query,
         key=key,
         value=value,
         kv_cache=kv_cache,
+        cu_seqlens_q=cu_seqlens_q,
+        cu_seqlens_k=cu_seqlens_k,
+        seqused_k=seqused_k,
+        # max_seqlen_q=max_seqlen_q,
+        # max_seqlen_k=max_seqlen_k,
+        num_seqs=num_seqs,
         block_tables=block_table,
-        mask=attn_mask,
+        mask=None,
         softmax_scale=1.0 / (head_size**0.5),
         mixed_precision=mixed_precision,
         LARGE_TILE_SZ=LARGE_TILE_SZ,
     )
-
-    o = flash_paged_attention[1, n_kv_head](**kwargs)
     return o
 
 

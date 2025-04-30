@@ -16,24 +16,35 @@ def neuron_paged_attn(
     key: torch.Tensor,
     value: torch.Tensor,
     kv_cache: torch.Tensor,
-    block_table: torch.Tensor,
-    attn_mask: torch.Tensor,
+    context_lens: torch.Tensor,
+    block_tables: torch.Tensor,
+    query_start_loc: torch.Tensor,
+    num_seqs: torch.Tensor,
 ) -> torch.Tensor:
-    from vllm.attention.ops.nki_flash_attn import flash_attn_varlen_nkifunc
-    N, _, n_kv_head, _, head_size = kv_cache.shape
-    assert N == 2, f"invalid {kv_cache.shape=}"
-    output_nki = flash_attn_varlen_nkifunc(
+    from vllm.attention.ops.nki_flash_attn import flash_attn_varlen_func
+
+    _, _, _, block_size, _ = kv_cache.shape
+
+    # block-aligned k/v lengths
+    # [3, 5, 4, 0] -(divide)-> [1, 2, 1, 0] -(multiply)-> [4, 8, 4, 0]
+    num_blocks_per_seq = (context_lens + block_size - 1) // block_size
+    zero = torch.tensor([0], dtype=context_lens.dtype, device=context_lens.device)
+    cu_ctx_lens_blockaligned = (
+        torch.cat((zero, context_lens), dim=0) * block_size
+    ).cumsum(dim=0)
+
+    output = flash_attn_varlen_func(
         query=query,
         key=key,
         value=value,
         kv_cache=kv_cache,
-        block_table=block_table,
-        attn_mask=attn_mask,
-        n_kv_head=n_kv_head,
-        head_size=head_size,
-        mixed_precision=True,
+        block_table=block_tables,
+        cu_seqlens_q=query_start_loc,
+        cu_seqlens_k=cu_ctx_lens_blockaligned,
+        seqused_k=context_lens,
+        num_seqs=num_seqs,
     )
-    return output_nki
+    return output
 
 
 @neuron_paged_attn.register_fake
@@ -42,8 +53,10 @@ def _(
     key: torch.Tensor,
     value: torch.Tensor,
     kv_cache: torch.Tensor,
-    block_table: torch.Tensor,
-    attn_mask: torch.Tensor,
+    context_lens: torch.Tensor,
+    block_tables: torch.Tensor,
+    query_start_loc: torch.Tensor,
+    num_seqs: torch.Tensor,
 ) -> torch.Tensor:
     return torch.empty_like(query.transpose(-2, -1))
 
@@ -92,17 +105,12 @@ class NeuronAttentionMetadata:
     # |-------------------- seq_len ---------------------|
     #                                   |-- query_len ---|
 
-    num_actual_tokens: int  # Number of tokens excluding padding.
-    max_query_len: int
-    query_start_loc: torch.Tensor
-    max_seq_len: int
-    seq_start_loc: torch.Tensor
-    block_table: torch.Tensor
+    # Used in the NeuronAttentionBackendImpl
     slot_mapping: torch.Tensor
-    num_active_blocks: int
-    active_block_table: torch.Tensor
-    attn_mask: torch.Tensor
-    num_input_tokens: int = 0  # Number of tokens including padding.
+    block_tables: torch.Tensor
+    context_lens: torch.Tensor
+    query_start_loc: torch.Tensor
+    num_seqs: int  # Number of actual sequences
 
 
 class NeuronAttentionMetadataBuilder(
@@ -162,16 +170,16 @@ class NeuronAttentionBackendImpl(AttentionImpl[NeuronAttentionMetadata]):
         key = key.unsqueeze(0).permute(0, 2, 3, 1).contiguous()
         value = value.unsqueeze(0).permute(0, 2, 1, 3).contiguous()
 
-        input_args = (
+        output = neuron_paged_attn(
             query,
             key,
             value,
             kv_cache,
-            attn_metadata.active_block_table,
-            attn_metadata.attn_mask,
+            attn_metadata.context_lens,
+            attn_metadata.block_tables,
+            attn_metadata.query_start_loc,
+            attn_metadata.num_seqs,
         )
-        output = neuron_paged_attn(*input_args)
-        output = output.transpose(1,
-                                  2).reshape(1, num_tokens,
-                                             self.num_heads * self.head_size)
+        output = output.transpose(1, 2).reshape(
+            1, num_tokens, self.num_heads * self.head_size)
         return output

@@ -581,16 +581,12 @@ class NeuronModelRunner:
         slot_mapping = slot_mapping.long().to(self.device)
         attn_mask = attn_mask.to(self.device)
         attn_metadata = NeuronAttentionMetadata(
-            num_actual_tokens=total_num_scheduled_tokens,
-            max_query_len=max_num_scheduled_tokens,
-            query_start_loc=query_start_loc,
-            max_seq_len=max_seq_len,
-            seq_start_loc=seq_start_loc,
-            block_table=self.input_batch.block_table.get_device_tensor()[:num_reqs],
             slot_mapping=slot_mapping,
-            num_active_blocks=num_active_blocks,
-            active_block_table=active_block_table,
-            attn_mask=attn_mask)
+            block_tables=block_tables,
+            context_lens=context_lens,
+            query_start_loc=query_start_loc,
+            num_seqs=torch.tensor([num_reqs], dtype=torch.int32, device=self.device),
+        )
 
         # NOTE(woosuk): Due to chunked prefills, there can be at most 1 partial
         # request in the batch. While we should not sample any token from this
@@ -904,19 +900,30 @@ class NeuronModelRunner:
         num_active_blocks_factor = (LARGE_TILE_SZ // self.block_size //
                                     num_active_blocks_shifted)
         num_active_blocks = num_active_blocks_shifted * num_active_blocks_factor
-        block_table = torch.arange((num_tokens // self.block_size) +
+        actual_num_reqs = min(num_tokens, self.max_num_reqs)
+        query_lens = [1] * self.max_num_reqs
+        slot_mapping = torch.zeros(num_tokens,
+                                   dtype=torch.int64,
+                                   device=self.device)
+        query_start_loc = torch.cumsum(torch.tensor([0] + query_lens,
+                                                    dtype=torch.int32),
+                                       dim=0,
+                                       dtype=torch.int32).to(self.device)
+        context_lens = torch.ones((self.max_num_reqs, ),
+                                  dtype=torch.int32,
+                                  device=self.device)
+        block_tables = torch.arange((num_tokens // self.block_size) +
                                    1).unsqueeze(0)
+        num_seqs = torch.tensor([actual_num_reqs],
+                                dtype=torch.int32,
+                                device=self.device)
 
         attn_metadata = NeuronAttentionMetadata(
-            num_actual_tokens=num_tokens,
-            max_query_len=num_tokens,
-            query_start_loc=torch.tensor([0, num_tokens - 1]).to(self.device),
-            max_seq_len=num_tokens,
-            seq_start_loc=torch.tensor([0, num_tokens - 1]).to(self.device),
-            block_table=block_table,
-            slot_mapping=torch.arange(0, num_tokens).long().to(self.device),
-            num_active_blocks=num_active_blocks,
-            block_table=block_table,
+            block_tables=block_tables,
+            slot_mapping=slot_mapping,
+            context_lens=context_lens,
+            query_start_loc=query_start_loc,
+            num_seqs=num_seqs,
         )
 
         if self.is_multimodal_model:
