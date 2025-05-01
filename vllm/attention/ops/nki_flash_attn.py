@@ -658,11 +658,7 @@ def flash_paged_attention(
     seqused_k,
     num_seqs,
     block_tables,
-    mask,
     softmax_scale=None,
-    mixed_precision=True,
-    LARGE_TILE_SZ=2048,
-    return_debug_tensors=False,
 ):
     """
     Flash PagedAttention Forward Kernel.
@@ -706,6 +702,9 @@ def flash_paged_attention(
       GQA: q: [b, h, d, s], k: [b, kv_h, d, s], v: [b, kv_h, s, d]
         usage: `flash_fwd[b, kv_h](q, k, v, ...)`
     """
+    mixed_precision = True
+    LARGE_TILE_SZ = 2048
+    return_debug_tensors = False
 
     B_F_SIZE = 512
     B_P_SIZE = 128
@@ -739,7 +738,8 @@ def flash_paged_attention(
     batch_id = nl.program_id(axis=0)
     head_id = nl.program_id(axis=1)
 
-    (num_active_blocks, ) = block_tables.shape
+    max_num_seqs, num_blocks_per_seq = block_tables.shape
+    num_active_blocks = 8192 // block_size
     context_kv_len = num_active_blocks * block_size
     assert (
         LARGE_TILE_SZ % B_F_SIZE == 0
@@ -1125,15 +1125,10 @@ def flash_attn_varlen_func(
     cu_seqlens_q,
     cu_seqlens_k,
     seqused_k,
-    # max_seqlen_q,
-    # max_seqlen_k,
     num_seqs,
 
-    block_table,
-    n_kv_head=None,
-    head_size=None,
-    LARGE_TILE_SZ=2048,
-    mixed_precision=True,
+    block_tables,
+    softmax_scale=None,
 ):
     """
     Compute flash paged attention for variable length sequences.
@@ -1153,13 +1148,6 @@ def flash_attn_varlen_func(
     N, _, n_kv_head, _, head_size = kv_cache.shape
     assert N == 2, f"invalid {kv_cache.shape=}"
 
-    if n_kv_head is None:
-        n_kv_head = kv_cache.shape[2]
-    assert kv_cache.shape[0] == 2
-    assert kv_cache.shape[2] == n_kv_head
-    if head_size is None:
-        head_size = kv_cache.shape[-1]
-
     o = flash_paged_attention[1, n_kv_head](
         query=query,
         key=key,
@@ -1168,14 +1156,9 @@ def flash_attn_varlen_func(
         cu_seqlens_q=cu_seqlens_q,
         cu_seqlens_k=cu_seqlens_k,
         seqused_k=seqused_k,
-        # max_seqlen_q=max_seqlen_q,
-        # max_seqlen_k=max_seqlen_k,
         num_seqs=num_seqs,
-        block_tables=block_table,
-        mask=None,
-        softmax_scale=1.0 / (head_size**0.5),
-        mixed_precision=mixed_precision,
-        LARGE_TILE_SZ=LARGE_TILE_SZ,
+        block_tables=block_tables,
+        softmax_scale=softmax_scale if softmax_scale else (1.0 / (head_size**0.5)),
     )
     return o
 
