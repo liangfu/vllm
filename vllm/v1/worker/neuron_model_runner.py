@@ -205,6 +205,7 @@ class NeuronModelRunner:
             (self.max_num_reqs, self.max_num_blocks_per_req),
             dtype=self.input_batch.block_table.get_cpu_tensor().dtype,
             device="cpu")
+        print(f"{self.block_table_cpu.shape=}")
 
         self.query_start_loc_cpu = torch.zeros(self.max_num_tokens + 1,
                                                dtype=torch.int32,
@@ -585,7 +586,7 @@ class NeuronModelRunner:
             block_tables=block_tables,
             context_lens=context_lens,
             query_start_loc=query_start_loc,
-            num_seqs=torch.tensor([num_reqs], dtype=torch.int32, device=self.device),
+            num_seqs=num_reqs, # torch.tensor([num_reqs], dtype=torch.int32, device=self.device),
         )
 
         # NOTE(woosuk): Due to chunked prefills, there can be at most 1 partial
@@ -912,11 +913,12 @@ class NeuronModelRunner:
         context_lens = torch.ones((self.max_num_reqs, ),
                                   dtype=torch.int32,
                                   device=self.device)
-        block_tables = torch.arange((num_tokens // self.block_size) +
-                                   1).unsqueeze(0)
-        num_seqs = torch.tensor([actual_num_reqs],
-                                dtype=torch.int32,
-                                device=self.device)
+        block_tables = torch.zeros(
+            (self.max_num_reqs, self.block_table_cpu.shape[1]),
+            dtype=torch.int32,
+            device=self.device)
+        print(f"_dummy_run: {block_tables.shape=}")
+        num_seqs = actual_num_reqs # torch.tensor([actual_num_reqs], dtype=torch.int32, device=self.device)
 
         attn_metadata = NeuronAttentionMetadata(
             block_tables=block_tables,

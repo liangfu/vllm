@@ -3,12 +3,15 @@ from dataclasses import dataclass
 from typing import Any, Optional
 
 import torch
+import torch.nn.functional as F
 
+from vllm.utils import round_up, cdiv
 from vllm.attention.backends.abstract import (AttentionBackend, AttentionImpl,
                                               AttentionMetadataBuilder,
                                               AttentionType)
 from vllm.attention.backends.utils import CommonAttentionState
 
+B_P_SIZE = 128
 
 @torch.library.custom_op("vllm::neuron_paged_attn", mutates_args=())
 def neuron_paged_attn(
@@ -19,8 +22,10 @@ def neuron_paged_attn(
     context_lens: torch.Tensor,
     block_tables: torch.Tensor,
     query_start_loc: torch.Tensor,
-    num_seqs: torch.Tensor,
+    num_seqs: int,
 ) -> torch.Tensor:
+    global B_P_SIZE
+
     from vllm.attention.ops.nki_flash_attn import flash_attn_varlen_func
 
     _, _, _, block_size, _ = kv_cache.shape
@@ -33,15 +38,31 @@ def neuron_paged_attn(
         torch.cat((zero, context_lens), dim=0) * block_size
     ).cumsum(dim=0)
 
+    # build active block table
+    # TODO(liangfu): move this implementation into NKI kernel
+    active_block_table = torch.tensor([], dtype=torch.int32, device=context_lens.device)
+    print(f"neuron_attn.py: {block_tables.shape=}")
+    print(f"{num_blocks_per_seq=}")
+    print(f"{num_seqs=}")
+    for seq_idx in range(num_seqs):
+        active_block_table = torch.cat((active_block_table, block_tables[seq_idx, :num_blocks_per_seq[seq_idx]]), dim=0)
+    num_blocks = active_block_table.numel()
+    active_block_table = F.pad(active_block_table, (0, round_up(num_blocks, B_P_SIZE)-num_blocks), "constant", 0).to(dtype=torch.int32)
+
+    max_seqlen_q = 128
+    max_seqlen_k = 2048
+
     output = flash_attn_varlen_func(
         query=query,
         key=key,
         value=value,
         kv_cache=kv_cache,
-        block_tables=block_tables,
+        block_tables=active_block_table,
         cu_seqlens_q=query_start_loc,
         cu_seqlens_k=cu_ctx_lens_blockaligned,
         seqused_k=context_lens,
+        max_seqlen_q=max_seqlen_q,
+        max_seqlen_k=max_seqlen_k,
         num_seqs=num_seqs,
     )
     return output
@@ -56,7 +77,7 @@ def _(
     context_lens: torch.Tensor,
     block_tables: torch.Tensor,
     query_start_loc: torch.Tensor,
-    num_seqs: torch.Tensor,
+    num_seqs: int,
 ) -> torch.Tensor:
     return torch.empty_like(query.transpose(-2, -1))
 

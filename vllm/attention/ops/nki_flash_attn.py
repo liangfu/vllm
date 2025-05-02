@@ -678,15 +678,16 @@ def transpose_kv_token_mask(mask, tiled_block_size):
         nl.store(mask_out[q_idx, i_p_dst, i_f_dst], value=transposed)
 
 
-import uuid
-@nki.baremetal(artifacts_dir=f"./_artifact_{str(uuid.uuid4().hex)[:8]}",
-               additional_compile_opt=(
-                   " -O1 --model-type=transformer --lnc=1 "
-                   " --enable-internal-data-race-checker "
-                   " --tensorizer-options='--skip-pass=NeuronValueNumbering' "),
-               debug_kernel=True,
-               show_compiler_tb=True,
-)
+# import uuid
+# @nki.baremetal(artifacts_dir=f"./_artifact_{str(uuid.uuid4().hex)[:8]}",
+#                additional_compile_opt=(
+#                    " -O1 --model-type=transformer --lnc=1 "
+#                    " --enable-internal-data-race-checker "
+#                    " --tensorizer-options='--skip-pass=NeuronValueNumbering' "),
+#                debug_kernel=True,
+#                show_compiler_tb=True,
+# )
+@nki.jit
 def flash_paged_attention(
     query,
     key,
