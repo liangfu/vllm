@@ -38,7 +38,7 @@ def neuron_paged_attn(
         key=key,
         value=value,
         kv_cache=kv_cache,
-        block_table=block_tables,
+        block_tables=block_tables,
         cu_seqlens_q=query_start_loc,
         cu_seqlens_k=cu_ctx_lens_blockaligned,
         seqused_k=context_lens,
