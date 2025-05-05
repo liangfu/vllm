@@ -50,7 +50,7 @@ LARGE_TILE_SZ = 2048
 
 # Here we utilize the behavior that out-of-bound index is ignored.
 # FIXME(woosuk): Find a more reliable way to prevent possible bugs.
-_PAD_SLOT_ID = 1_000_000_000
+_PAD_SLOT_ID = -1
 INVALID_TOKEN_ID = -1
 # Smallest output size
 MIN_NUM_SEQS = 8
@@ -63,28 +63,28 @@ MIN_NUM_SEQS = 8
 # The model executor has two primary components:
 # 1. preparing the model and sampler inputs
 # 2. executing the model and sampler.
-# The core idea is to avoid any TPU computation during input preparation. For
+# The core idea is to avoid any device computation during input preparation. For
 # better compilation tracking and increased flexibility, the model execution and
 # sampler are divided into several distinct components.
 #
 # Below are the detailed steps:
 #
 # Step 1
-# It is recommended to avoid TPU operations when preparing the model and sampler
+# It is recommended to avoid device operations when preparing the model and sampler
 # inputs. CPU tensors can be prepared and transferred to the XLA device using
-# cpu_tensor.to(xla_device), which only triggers CPU to TPU transfers and avoids
+# cpu_tensor.to(xla_device), which only triggers CPU to device transfers and avoids
 # compilation.
 #
 # Step 2
-# The TPU execution should be decomposed into subgraphs (4 at the moment):
+# The device execution should be decomposed into subgraphs (4 at the moment):
 # 1. the main model
 # 2. selecting hidden states for each request
-# 3. sampler
-# 4. encoder.
+# 3. compute logits
+# 4. sampler
 # Each subgraph should be decorated in a torch.compile. This is used to make
 # sure that we have the same subgraph topology in both dummy_run and
 # xecute_model. The results from these subgraphs should either be passed to
-# other subgraphs, or transferred from TPU to CPU using xla_tensor.cpu() for
+# other subgraphs, or transferred from device to CPU using xla_tensor.cpu() for
 # subsequent processing on the CPU.
 #
 # Step 3
@@ -536,7 +536,7 @@ class NeuronModelRunner:
             self.input_batch.num_computed_tokens_cpu[:num_reqs] +
             num_scheduled_tokens_per_req)
 
-        # Do the padding and copy the tensors to the TPU.
+        # Do the padding and copy the tensors to the device.
         padded_total_num_scheduled_tokens = _get_padded_token_len(
             self.num_tokens_paddings, total_num_scheduled_tokens)
         # Zero out to avoid spurious values from prev iteration (last cp chunk)
@@ -578,9 +578,8 @@ class NeuronModelRunner:
 
         logits_indices = query_start_loc[1:] - 1
         query_start_loc = query_start_loc.to(self.device)
-        seq_start_loc = seq_start_loc.to(self.device)
         slot_mapping = slot_mapping.long().to(self.device)
-        attn_mask = attn_mask.to(self.device)
+        # attn_mask = attn_mask.to(self.device)
         attn_metadata = NeuronAttentionMetadata(
             slot_mapping=slot_mapping,
             block_tables=block_tables,
@@ -776,12 +775,16 @@ class NeuronModelRunner:
         # Prepare inputs
         attn_metadata, logits_indices, padded_num_reqs = self._prepare_inputs(
             scheduler_output)
+        print(f"{attn_metadata=}, {logits_indices=}, {padded_num_reqs=}")
         input_ids, inputs_embeds = self._get_model_inputs(
             self.input_ids, mm_embeds)
         xm.mark_step()
         num_reqs = self.input_batch.num_reqs
+        print(f"{input_ids=}, {inputs_embeds=}, {num_reqs=}, {scheduler_output.total_num_scheduled_tokens=}")
+        print(f"{self.position_ids=}")
         # Run the decoder
-        with set_forward_context(attn_metadata, self.vllm_config):
+        with set_forward_context(attn_metadata, self.vllm_config,
+                                 num_tokens=scheduler_output.total_num_scheduled_tokens):
             hidden_states = self.model(
                 input_ids=input_ids,
                 positions=self.position_ids,
@@ -890,8 +893,10 @@ class NeuronModelRunner:
             model = model.eval().to(self.device)
             xm.mark_step()
             xm.wait_device_ops()
+            # self.model = torch.compile(
+            #     model, backend="openxla", fullgraph=True, dynamic=False)
             self.model = torch.compile(
-                model, backend="openxla", fullgraph=True, dynamic=False)
+                model, backend="eager", dynamic=False)
             self.sampler = NeuronSampler()
 
     @torch.inference_mode()

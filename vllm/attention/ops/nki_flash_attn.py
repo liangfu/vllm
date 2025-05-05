@@ -25,6 +25,8 @@ def load_active_block_tables(block_tables_hbm, num_tiles, num_blocks_per_tile):
     In case `num_tiles > B_P_SIZE`, we need further tile `num_tile` dimension.
     """
     global B_P_SIZE
+    partition_size = min(B_P_SIZE, num_tiles)
+    print(f"{block_tables_hbm.shape=}, {num_tiles=}, {num_blocks_per_tile=}")
 
     # reshape as `(num_tiles, num_blocks_per_tile)`
     assert len(block_tables_hbm.shape) == 1
@@ -33,17 +35,18 @@ def load_active_block_tables(block_tables_hbm, num_tiles, num_blocks_per_tile):
     block_tables_hbm = block_tables_hbm.reshape(
         (num_tiles, num_blocks_per_tile))
 
+    num_partitions = cdiv(num_tiles, partition_size)
     block_tables_sbuf = nl.zeros(
-        (cdiv(num_tiles, B_P_SIZE), par_dim(B_P_SIZE), num_blocks_per_tile),
+        (par_dim(partition_size), num_partitions, num_blocks_per_tile),
         dtype=nl.int32,
     )
-    for i in nl.affine_range(cdiv(num_tiles, B_P_SIZE)):
-        i_p = nl.arange(B_P_SIZE)[:, None]
+    for i in nl.affine_range(num_partitions):
+        i_p = nl.arange(partition_size)[:, None]
         i_f = nl.arange(num_blocks_per_tile)[None, :]
-        block_tables_sbuf[i, i_p, i_f] = nl.load(
-            block_tables_hbm[i_p + i * B_P_SIZE, i_f],
+        block_tables_sbuf[i_p, i, i_f] = nl.load(
+            block_tables_hbm[i_p + i * partition_size, i_f],
             dtype=nl.int32,
-            mask=(i_p + i * B_P_SIZE < num_tiles),
+            mask=(i_p + i * partition_size < num_tiles),
         )
     return block_tables_sbuf
 
@@ -111,18 +114,17 @@ def transform_block_tables_for_indirect_load(
     """
     global B_P_SIZE
 
-    num_partitions, num_tiles_per_partition, num_blocks_per_tile = (
+    partition_size, num_partitions, num_blocks_per_tile = (
         block_tables.shape)
-    assert num_tiles_per_partition == B_P_SIZE
     assert is_power_of_2(
         num_blocks_per_tile), f"{num_blocks_per_tile=} is not power of 2"
 
     num_loads = cdiv(num_blocks_per_tile, B_P_SIZE)
     block_tables_transposed = nl.ndarray(
         (
-            num_loads,
             par_dim(B_P_SIZE),
-            num_partitions * num_tiles_per_partition,
+            num_loads,
+            num_partitions * partition_size,
         ),
         dtype=nl.int32,
     )
@@ -131,14 +133,14 @@ def transform_block_tables_for_indirect_load(
     if num_head > 1:
         head_id = nisa.iota(head_id, dtype=nl.int32).reshape((1, 1))
         head_id = nl.transpose(
-            head_id.broadcast_to((1, num_tiles_per_partition)))
+            head_id.broadcast_to((1, partition_size)))
         if num_blocks_per_tile > 1:
             head_id = head_id.broadcast_to(
-                (num_tiles_per_partition, num_blocks_per_tile))
+                (partition_size, num_blocks_per_tile))
 
     if block_size_tiling_factor > 1:
         broadcast_shape = (
-            num_tiles_per_partition,
+            partition_size,
             num_blocks_per_tile,
             block_size_tiling_factor,
         )
@@ -146,7 +148,7 @@ def transform_block_tables_for_indirect_load(
                            dtype=nl.int32).broadcast_to(broadcast_shape)
 
     for partition_id in nl.affine_range(num_partitions):
-        block_tables_partition = block_tables[partition_id]
+        block_tables_partition = block_tables[:, partition_id]
         if num_head > 1:
             # fuse num_block and num_head dimension
             block_tables_partition = block_tables_partition * num_head + head_id
@@ -156,22 +158,19 @@ def transform_block_tables_for_indirect_load(
             assert num_blocks_per_tile * block_size_tiling_factor == B_P_SIZE
             block_tables_partition = ((block_tables_partition *
                                        block_size_tiling_factor).reshape(
-                                           (num_tiles_per_partition,
+                                           (partition_size,
                                             num_blocks_per_tile,
                                             1)).broadcast_to(broadcast_shape))
             new_block_tables = block_tables_partition + offset
             new_block_tables = new_block_tables.reshape(
-                (num_tiles_per_partition, B_P_SIZE))
+                (partition_size, B_P_SIZE))
         else:
             new_block_tables = block_tables_partition
 
         # transpose the block table so that it can be used by vector DGE
         for i in nl.affine_range(num_loads):
-            i_p = nl.arange(B_P_SIZE)[:, None]
-            i_f = (partition_id * num_tiles_per_partition +
-                   nl.arange(num_tiles_per_partition)[None, :])
-            block_tables_transposed[i, i_p, i_f] = nl.transpose(
-                new_block_tables[:, nl.ds(i * B_P_SIZE, B_P_SIZE)])
+            block_tables_transposed[:, i, nl.ds(partition_id * partition_size, partition_size)] = nl.transpose(
+                new_block_tables[:, nl.ds(i * partition_size, partition_size)])
     return block_tables_transposed
 
 
@@ -204,7 +203,7 @@ def load_kv_tile_from_cache(
     for load_idx in nl.affine_range(num_loads):
         i_p = nl.arange(B_P_SIZE)[:, None]
         i_f = nl.arange(tiled_block_size * B_D_SIZE)[None, :]
-        loaded = nl.load(kv_cache[0, block_tables[load_idx, i_p,
+        loaded = nl.load(kv_cache[0, block_tables[i_p, load_idx,
                                                   large_k_tile_idx], i_f])
         if cur_k_tile.dtype != loaded.dtype:
             loaded = nl.copy(loaded, dtype=cur_k_tile.dtype)
@@ -220,7 +219,7 @@ def load_kv_tile_from_cache(
 
     # load value cache
     for load_idx in nl.affine_range(num_loads):
-        loaded = nl.load(kv_cache[1, block_tables[load_idx, i_p,
+        loaded = nl.load(kv_cache[1, block_tables[i_p, load_idx,
                                                   large_k_tile_idx], i_f])
         if cur_v_tile.dtype != loaded.dtype:
             loaded = nl.copy(loaded, dtype=cur_v_tile.dtype)
@@ -678,16 +677,17 @@ def transpose_kv_token_mask(mask, tiled_block_size):
         nl.store(mask_out[q_idx, i_p_dst, i_f_dst], value=transposed)
 
 
-# import uuid
-# @nki.baremetal(artifacts_dir=f"./_artifact_{str(uuid.uuid4().hex)[:8]}",
-#                additional_compile_opt=(
-#                    " -O1 --model-type=transformer --lnc=1 "
-#                    " --enable-internal-data-race-checker "
-#                    " --tensorizer-options='--skip-pass=NeuronValueNumbering' "),
-#                debug_kernel=True,
-#                show_compiler_tb=True,
-# )
-@nki.jit
+import uuid
+@nki.baremetal(artifacts_dir=f"./_artifact_{str(uuid.uuid4().hex)[:8]}",
+               additional_compile_opt=(
+                   " -O1 --model-type=transformer --lnc=1 "
+                   " --enable-internal-data-race-checker "
+                   " --internal-compiler-debug-mode=penguin "
+                   " --tensorizer-options='--skip-pass=NeuronValueNumbering' "),
+               debug_kernel=True,
+               show_compiler_tb=True,
+)
+# @nki.jit
 def flash_paged_attention(
     query,
     key,

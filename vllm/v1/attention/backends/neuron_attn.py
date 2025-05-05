@@ -48,9 +48,10 @@ def neuron_paged_attn(
         active_block_table = torch.cat((active_block_table, block_tables[seq_idx, :num_blocks_per_seq[seq_idx]]), dim=0)
     num_blocks = active_block_table.numel()
     active_block_table = F.pad(active_block_table, (0, round_up(num_blocks, B_P_SIZE)-num_blocks), "constant", 0).to(dtype=torch.int32)
+    print(f"{active_block_table.shape=}")
 
     max_seqlen_q = 128
-    max_seqlen_k = 2048
+    max_seqlen_k = round_up(num_blocks * block_size, 2048)
 
     output = flash_attn_varlen_func(
         query=query,
@@ -65,6 +66,7 @@ def neuron_paged_attn(
         max_seqlen_k=max_seqlen_k,
         num_seqs=num_seqs,
     )
+    print(f"{output.shape=}")
     return output
 
 
@@ -174,7 +176,8 @@ class NeuronAttentionBackendImpl(AttentionImpl[NeuronAttentionMetadata]):
     ) -> torch.Tensor:
         from vllm.attention.ops.nki_flash_attn import reshape_and_cache
 
-        num_tokens = query.shape[1]
+        print(f"{query.shape=}, {key.shape=}, {value.shape=}")
+        num_tokens = query.shape[-2]
         key = key.view(num_tokens, self.num_kv_heads, self.head_size)
         value = value.view(num_tokens, self.num_kv_heads, self.head_size)
 

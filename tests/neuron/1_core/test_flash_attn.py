@@ -249,6 +249,7 @@ def test_varlen_with_paged_kv(
         active_block_table = torch.cat((active_block_table, block_tables[seq_idx, :num_blocks_per_seq[seq_idx]]), dim=0)
     num_blocks = active_block_table.numel()
     active_block_table = F.pad(active_block_table, (0, round_up(num_blocks, B_P_SIZE)-num_blocks), "constant", 0).to(dtype=torch.int32)
+    print(f"{active_block_table.shape=}")
 
     max_seqlen_q = round_up(max(query_lens), 128)
     max_seqlen_k = round_up(max(kv_lens), 2048)
