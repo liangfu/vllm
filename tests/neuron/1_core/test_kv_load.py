@@ -3,6 +3,7 @@
 import os
 
 import neuronxcc.nki.language as nl
+import numpy as np
 import pytest
 import torch
 import torch.nn.functional as F
@@ -10,7 +11,8 @@ from neuronxcc import nki
 
 from vllm.utils import cdiv, round_up
 from vllm.attention.ops.nki_flash_attn import (
-    load_active_block_tables, transform_block_tables_for_indirect_load)
+    load_active_block_tables, transform_block_tables_for_indirect_load,
+    load_kv_tile_from_cache)
 
 B_P_SIZE = 128
 
@@ -83,7 +85,7 @@ def ref_block_tables_transform(
                                         B_P_SIZE, num_tiles_padded)
 
 
-@nki.compiler.skip_middle_end_transformations
+# @nki.compiler.skip_middle_end_transformations
 @nki.jit
 def nki_kv_load(
     key_cache,
@@ -131,7 +133,7 @@ def nki_kv_load(
         dtype=key_cache.dtype,
         buffer=nl.shared_hbm,
     )
-    num_loads = ceil_div(num_blocks_per_tile, B_P_SIZE)
+    num_loads = cdiv(num_blocks_per_tile, B_P_SIZE)
     v_out = nl.ndarray(
         (num_head, num_tiles, B_P_SIZE, num_loads * tiled_block_size * B_D_SIZE),
         dtype=value_cache.dtype,
@@ -145,17 +147,16 @@ def nki_kv_load(
     value_cache = value_cache.reshape(new_cache_shape)
 
     k_buffer = nl.ndarray(
-        (par_dim(B_P_SIZE), num_loads, block_size * B_D_SIZE),
+        (nl.par_dim(B_P_SIZE), num_loads, block_size * B_D_SIZE),
         dtype=key_cache.dtype,
     )
     v_buffer = nl.ndarray(
-        (par_dim(B_P_SIZE), num_loads * tiled_block_size * B_D_SIZE),
+        (nl.par_dim(B_P_SIZE), num_loads * tiled_block_size * B_D_SIZE),
         dtype=value_cache.dtype,
     )
     for large_tile_idx in nl.sequential_range(num_tiles):
         cur_k_tile, cur_v_tile = load_kv_tile_from_cache(
-            key_cache=key_cache,
-            value_cache=value_cache,
+            kv_cache=kv_cache,
             block_tables=block_tables_transposed,
             large_k_tile_idx=large_tile_idx,
             num_blocks_per_large_tile=num_blocks_per_tile,
@@ -164,7 +165,7 @@ def nki_kv_load(
             kernel_dtype=kernel_dtype,
             k_load_buffer=k_buffer,
             v_load_buffer=v_buffer,
-            identity_for_transpose=identity_for_transpose_k,
+            # identity_for_transpose=identity_for_transpose_k,
         )
         nl.store(dst=k_out[head_id, large_tile_idx], value=cur_k_tile)
         nl.store(dst=v_out[head_id, large_tile_idx], value=cur_v_tile)

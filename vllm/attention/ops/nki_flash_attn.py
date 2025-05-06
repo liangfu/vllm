@@ -169,7 +169,7 @@ def transform_block_tables_for_indirect_load(
         # transpose the block table so that it can be used by vector DGE
         for i in nl.affine_range(num_loads):
             block_tables_transposed[:, i, nl.ds(partition_id * num_tiles_per_partition, num_tiles_per_partition)] = nl.transpose(
-                new_block_tables[:, nl.ds(i * num_tiles_per_partition, num_tiles_per_partition)])
+                new_block_tables[:, nl.ds(i * B_P_SIZE, B_P_SIZE)])
     return block_tables_transposed
 
 
@@ -212,8 +212,6 @@ def load_kv_tile_from_cache(
     )
 
     for load_idx in nl.affine_range(num_loads):
-        import pdb
-        pdb.set_trace()
         tiled_block_idx = block_tables[i_p, load_idx, large_k_tile_idx]
         k_load_buffer[i_p, load_idx, i_f] = nl.load(kv_cache[tiled_block_idx, i_f], mode=oob_mode.skip)
         if kernel_dtype != kv_cache.dtype:
@@ -919,13 +917,13 @@ def flash_paged_attention(
                          tiled_block_size=tiled_block_size,
     )
 
+    assert prior_mask.shape[-1] == (num_large_k_tile * LARGE_TILE_SZ), (
+        f"unexpected prior_mask shape ({prior_mask.shape})")
     for large_k_tile_idx in nl.sequential_range(0, num_large_k_tile):
         cur_mask = nl.load(prior_mask[
             nl.ds(0, B_P_SIZE),
             nl.ds(large_k_tile_idx * LARGE_TILE_SZ, LARGE_TILE_SZ),
         ])
-        # if tiled_block_size > 1:
-        #     cur_mask = transpose_kv_token_mask(cur_mask, tiled_block_size)
         nl.store(mask_output[head_id, large_k_tile_idx, :, :], cur_mask[:, :])
 
     num_loads = num_blocks_per_large_tile // B_P_SIZE
