@@ -11,6 +11,7 @@ from vllm.platforms import current_platform
 from vllm.attention.ops.nki_flash_attn import flash_attn_varlen_func
 
 B_P_SIZE = 128
+LARGE_TILE_SZ = 2048
 
 NUM_HEADS = [(4, 4), (8, 2)]
 HEAD_SIZES = [128]
@@ -248,8 +249,9 @@ def test_varlen_with_paged_kv(
     for seq_idx in range(num_seqs):
         active_block_table = torch.cat((active_block_table, block_tables[seq_idx, :num_blocks_per_seq[seq_idx]]), dim=0)
     num_blocks = active_block_table.numel()
-    active_block_table = F.pad(active_block_table, (0, round_up(num_blocks, B_P_SIZE)-num_blocks), "constant", 0).to(dtype=torch.int32)
-    print(f"{active_block_table.shape=}")
+    max_num_blocks = round_up(block_tables.numel(), 2048)
+    active_block_table = F.pad(active_block_table, (0, max_num_blocks-num_blocks), "constant", 0).to(dtype=torch.int32)
+    print(f"{block_tables.shape=}, {active_block_table.shape=}, {max_num_blocks=}")
 
     max_seqlen_q = round_up(max(query_lens), 128)
     max_seqlen_k = round_up(max(kv_lens), 2048)
