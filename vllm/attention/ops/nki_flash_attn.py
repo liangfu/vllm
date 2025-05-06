@@ -159,7 +159,7 @@ def transform_block_tables_for_indirect_load(
             assert num_blocks_per_tile * block_size_tiling_factor == B_P_SIZE
             block_tables_partition = (
                 block_tables_partition * block_size_tiling_factor
-            ).reshape(num_tiles_per_partition, num_blocks_per_tile, 1
+            ).reshape(shape=(num_tiles_per_partition, num_blocks_per_tile, 1)
             ).broadcast_to(broadcast_shape)
             new_block_tables = block_tables_partition + offset
             new_block_tables = new_block_tables.reshape((num_tiles_per_partition, B_P_SIZE))
@@ -865,8 +865,6 @@ def flash_paged_attention(
         num_head=k_h,
         head_id=head_id,
     )
-    import pdb
-    pdb.set_trace()
 
     # Flatten KV cache to be 2D for loading into SBUF
     new_cache_shape = (
