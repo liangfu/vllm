@@ -687,16 +687,16 @@ def transpose_kv_token_mask(mask, tiled_block_size):
 
 
 import uuid
-@nki.baremetal(artifacts_dir=f"./_artifact_{str(uuid.uuid4().hex)[:8]}",
-               additional_compile_opt=(
-                   " -O1 --model-type=transformer --lnc=1 "
-                   " --enable-internal-data-race-checker "
-                   " --internal-compiler-debug-mode=penguin "
-                   " --tensorizer-options='--skip-pass=NeuronValueNumbering' "),
-               debug_kernel=True,
-               show_compiler_tb=True,
-)
-# @nki.jit
+# @nki.baremetal(artifacts_dir=f"./_artifact_{str(uuid.uuid4().hex)[:8]}",
+#                additional_compile_opt=(
+#                    " -O1 --model-type=transformer --lnc=1 "
+#                    " --enable-internal-data-race-checker "
+#                    " --internal-compiler-debug-mode=penguin "
+#                    " --tensorizer-options='--skip-pass=NeuronValueNumbering' "),
+#                debug_kernel=True,
+#                show_compiler_tb=True,
+# )
+@nki.jit(mode="simulation")
 def flash_paged_attention(
     query,
     key,
@@ -849,8 +849,8 @@ def flash_paged_attention(
         # we checked num_blocks_per_tile is a power of 2
         assert B_P_SIZE % num_blocks_per_large_tile == 0
         block_size_tiling_factor = B_P_SIZE // num_blocks_per_large_tile
-        # We assume block_size >= block_size_tiling_factor
         assert block_size % block_size_tiling_factor == 0
+        num_blocks_per_large_tile *= block_size_tiling_factor  # i.e. = B_P_SIZE
     else:
         block_size_tiling_factor = 1
     tiled_block_size = block_size // block_size_tiling_factor
@@ -918,7 +918,7 @@ def flash_paged_attention(
     )
 
     assert prior_mask.shape[-1] == (num_large_k_tile * LARGE_TILE_SZ), (
-        f"unexpected prior_mask shape ({prior_mask.shape})")
+        f"unexpected prior_mask shape: {prior_mask.shape=}, {num_large_k_tile=}")
     for large_k_tile_idx in nl.sequential_range(0, num_large_k_tile):
         cur_mask = nl.load(prior_mask[
             nl.ds(0, B_P_SIZE),

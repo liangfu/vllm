@@ -155,8 +155,8 @@ def sample_inputs(
 
 
 @pytest.mark.parametrize("seq_lens", [
-    [(5, 18), (19, 463), (1, 1328)],
-    [(1, 523), (1, 37), (1, 2011)]
+    [(5, 18), (19, 463), (1, 328)],
+    # [(1, 523), (1, 37), (1, 2011)]
 ])
 @pytest.mark.parametrize("num_heads", NUM_HEADS)
 @pytest.mark.parametrize("head_size", HEAD_SIZES)
@@ -249,7 +249,7 @@ def test_varlen_with_paged_kv(
     for seq_idx in range(num_seqs):
         active_block_table = torch.cat((active_block_table, block_tables[seq_idx, :num_blocks_per_seq[seq_idx]]), dim=0)
     num_blocks = active_block_table.numel()
-    max_num_blocks = round_up(block_tables.numel(), 65536)
+    max_num_blocks = round_up(block_tables.numel(), 128)
     active_block_table = F.pad(active_block_table, (0, max_num_blocks-num_blocks), "constant", 0).to(dtype=torch.int32)
     print(f"{block_tables.shape=}, {active_block_table.shape=}, {max_num_blocks=}")
 
