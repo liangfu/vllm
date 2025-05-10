@@ -36,6 +36,7 @@ from vllm.v1.kv_cache_interface import (AttentionSpec, FullAttentionSpec,
 from vllm.v1.outputs import (EMPTY_MODEL_RUNNER_OUTPUT, LogprobsTensors,
                              ModelRunnerOutput)
 from vllm.v1.sample.neuron.metadata import NeuronSupportedSamplingMetadata
+from vllm.v1.sample.neuron.sampler import neuron_argmax
 from vllm.v1.sample.neuron.sampler import Sampler as NeuronSampler
 from vllm.v1.utils import bind_kv_cache
 from vllm.v1.worker.gpu_input_batch import CachedRequestState, InputBatch
@@ -893,10 +894,10 @@ class NeuronModelRunner:
             model = model.eval().to(self.device)
             xm.mark_step()
             xm.wait_device_ops()
-            # self.model = torch.compile(
-            #     model, backend="openxla", fullgraph=True, dynamic=False)
             self.model = torch.compile(
-                model, backend="eager", dynamic=False)
+                model, backend="openxla", fullgraph=True, dynamic=False)
+            # self.model = torch.compile(
+            #     model, backend="eager", dynamic=False) # debugging only
             self.sampler = NeuronSampler()
 
     @torch.inference_mode()
@@ -922,8 +923,8 @@ class NeuronModelRunner:
             (self.max_num_reqs, self.block_table_cpu.shape[1]),
             dtype=torch.int32,
             device=self.device)
-        print(f"_dummy_run: {block_tables.shape=}")
         num_seqs = actual_num_reqs # torch.tensor([actual_num_reqs], dtype=torch.int32, device=self.device)
+        print(f"_dummy_run: {block_tables.shape=}, {slot_mapping.shape=}, {context_lens.shape=}, {query_start_loc.shape=}, {num_seqs=}")
 
         attn_metadata = NeuronAttentionMetadata(
             block_tables=block_tables,
@@ -941,12 +942,9 @@ class NeuronModelRunner:
             inputs_embeds = None
         with set_forward_context(attn_metadata, self.vllm_config):
             hidden_states = self.model(
-                input_ids=input_ids.unsqueeze(0).to(self.device)
-                if input_ids is not None else None,
-                positions=self.positions_cpu[:num_tokens].unsqueeze(0).to(
-                    self.device),
-                inputs_embeds=inputs_embeds.to(self.device)
-                if inputs_embeds is not None else None,
+                input_ids=input_ids.to(self.device) if input_ids is not None else None,
+                positions=self.positions_cpu[:num_tokens].to(self.device),
+                inputs_embeds=inputs_embeds.to(self.device) if inputs_embeds is not None else None,
             )
         return hidden_states
 
@@ -1040,7 +1038,7 @@ class NeuronModelRunner:
         self._precompile_backbone()
         self._precompile_select_hidden_states()
         self._precompile_compute_logits()
-        # self._precompile_sample_from_logits()
+        self._precompile_sample_from_logits()
 
     def profile_run(
         self,
@@ -1119,7 +1117,9 @@ class NeuronModelRunner:
             self, logits: torch.Tensor,
             sampling_metadata: NeuronSupportedSamplingMetadata) -> torch.Tensor:
         if sampling_metadata.all_greedy:
-            out_tokens = torch.argmax(logits, dim=-1, keepdim=True)
+            out_tokens = neuron_argmax(logits)
+            # from torch_neuronx.xla_impl.ops import Argmax
+            # return Argmax.apply(logits, dim=-1, keepdim=True)
         else:
             out_tokens = self.sampler(logits,
                                       sampling_metadata).sampled_token_ids

@@ -17,6 +17,9 @@ LARGE_TILE_SZ = 2048
 def is_power_of_2(x):
     return x > 0 and (x & (x - 1)) == 0
 
+def _print(*args, **kwargs):
+    pass
+
 @nki.jit
 def load_active_block_tables(block_tables_hbm, num_tiles, num_blocks_per_tile):
     """
@@ -27,7 +30,8 @@ def load_active_block_tables(block_tables_hbm, num_tiles, num_blocks_per_tile):
     """
     global B_P_SIZE
     partition_size = min(B_P_SIZE, num_tiles)
-    print(f"{block_tables_hbm.shape=}, {num_tiles=}, {num_blocks_per_tile=}")
+    assert partition_size > 0, f"invalid partition size: {partition_size=}"
+    _print(f"{block_tables_hbm.shape=}, {num_tiles=}, {num_blocks_per_tile=}, {partition_size=}")
 
     # reshape as `(num_tiles, num_blocks_per_tile)`
     assert len(block_tables_hbm.shape) == 1
@@ -522,14 +526,14 @@ def build_attention_mask(
     +-------------------------------------------------------+
     """
 
-    print(f"{cu_query_lens.shape=}")
+    _print(f"{cu_query_lens.shape=}")
     i_p = nl.arange(1)[:, None]
     cu_f = nl.arange(max_num_seqs + 1)[None, :]
     i_f = nl.arange(max_num_seqs)[None, :]
     cu_query_lens_sbuf = nl.load(cu_query_lens[cu_f])
     cu_ctx_lens_sbuf = nl.load(cu_ctx_lens[cu_f])
     seq_lens_sbuf = seq_lens
-    print(
+    _print(
         f"{cu_query_lens_sbuf.shape=}, {max_num_queries=}, {max_num_keys=}, {max_num_seqs=}, {block_size=}"
     )
     query_lens = cu_query_lens_sbuf[i_p, i_f + 1] - cu_query_lens_sbuf[i_p,
@@ -551,7 +555,7 @@ def build_attention_mask(
     q_tile_size, k_tile_size = max_num_queries, max_num_keys  # max_num_queries, 8
     n_q_tile = (max_num_queries + q_tile_size - 1) // q_tile_size
     n_k_tile = (max_num_keys + k_tile_size - 1) // k_tile_size
-    print(f"{n_q_tile=}, {n_k_tile=}")
+    _print(f"{n_q_tile=}, {n_k_tile=}")
     i_p = nl.arange(q_tile_size)[:, None]  # this works for dynamic access
     i_f = nl.arange(k_tile_size)[None, :]
 
@@ -572,7 +576,7 @@ def build_attention_mask(
     expr_b = nl.arange(0, k_tile_size)[None, :]
     b_tile = nisa.iota(expr_b, dtype=nl.int32)
     _br(b_tile, b)
-    print(f"{a.shape=}, {b.shape=}, {a_tile.shape=}, {b_tile.shape=}")
+    _print(f"{a.shape=}, {b.shape=}, {a_tile.shape=}, {b_tile.shape=}")
 
     # iota_hbm = nl.ndarray((2, q_tile_size, k_tile_size), dtype=nl.int32, buffer=nl.shared_hbm)
     # new_mask_hbm = nl.ndarray((max_num_seqs, n_k_tile, q_tile_size, k_tile_size), dtype=nl.int32, buffer=nl.shared_hbm)
@@ -605,7 +609,7 @@ def build_attention_mask(
         _br(cu_ctx_lens_sbuf[0, seq_idx], ci)
         _br(query_lens[0, seq_idx], nr)
         _br(ctx_lens[0, seq_idx], nc)
-        print(f"{ci.shape=}, {nc.shape=}, {ri.shape=}, {nr.shape=}")
+        _print(f"{ci.shape=}, {nc.shape=}, {ri.shape=}, {nr.shape=}")
 
         for k_tile_idx in nl.sequential_range(n_k_tile):
             q_tile_idx = 0
@@ -667,7 +671,7 @@ def transpose_kv_token_mask(mask, tiled_block_size):
     num_block = size_kv // tiled_block_size
     assert num_block >= B_P_SIZE
     num_batch = num_block // B_P_SIZE
-    print(f"{size_q=}, {num_batch=}, {B_P_SIZE=}, {tiled_block_size=}")
+    _print(f"{size_q=}, {num_batch=}, {B_P_SIZE=}, {tiled_block_size=}")
     transpose_range = B_P_SIZE * tiled_block_size
     new_mask_shape1 = (
         size_q*num_batch, B_P_SIZE, tiled_block_size
@@ -682,7 +686,7 @@ def transpose_kv_token_mask(mask, tiled_block_size):
     for q_idx in nl.sequential_range(size_q):
         tile = nl.load(mask_re[q_idx, i_p_src, i_f_src])
         transposed = nl.transpose(tile)
-        print(f"{transposed.shape=}")
+        _print(f"{transposed.shape=}")
         nl.store(mask_out[q_idx, i_p_dst, i_f_dst], value=transposed)
 
 
@@ -696,7 +700,7 @@ import uuid
 #                debug_kernel=True,
 #                show_compiler_tb=True,
 # )
-@nki.jit(mode="simulation")
+@nki.jit
 def flash_paged_attention(
     query,
     key,
@@ -708,7 +712,7 @@ def flash_paged_attention(
     max_seqlen_q, max_seqlen_k,
     num_seqs,
     block_tables,
-    softmax_scale=None,
+    softmax_scale,
 ):
     """
     Flash PagedAttention Forward Kernel.
@@ -812,6 +816,7 @@ def flash_paged_attention(
     acc_type = np.dtype(np.float32) if mixed_precision else kernel_dtype
     softmax_scale = softmax_scale or (1.0 / (d**0.5))
     num_large_k_tile = context_kv_len // LARGE_TILE_SZ
+    assert num_large_k_tile>0, f"invalid num_large_k_tile: {num_large_k_tile=}, {context_kv_len=}"
 
     o = nl.ndarray((b, h, seqlen_q, d),
                    dtype=query.dtype,
@@ -854,7 +859,7 @@ def flash_paged_attention(
     else:
         block_size_tiling_factor = 1
     tiled_block_size = block_size // block_size_tiling_factor
-    print(f"{tiled_block_size=}, {block_size=}, {block_size_tiling_factor=}")
+    _print(f"{tiled_block_size=}, {block_size=}, {block_size_tiling_factor=}")
 
     # Indirect DMA load must be placed along Partition Dimension
     block_tables_sbuf = transform_block_tables_for_indirect_load(
@@ -901,7 +906,7 @@ def flash_paged_attention(
                              dtype=nl.bool_,
                              buffer=nl.private_hbm)
     mask_output = nl.ndarray((k_h, num_large_k_tile, B_P_SIZE, LARGE_TILE_SZ), buffer=nl.shared_hbm, dtype=nl.bool_)
-    print(f"{num_large_k_tile=}, {n_tile_q=}, {B_P_SIZE=}, {LARGE_TILE_SZ=}")
+    _print(f"{num_large_k_tile=}, {n_tile_q=}, {B_P_SIZE=}, {LARGE_TILE_SZ=}")
 
     i_p = nl.arange(1)[:, None]
     i_f = nl.arange(max_num_seqs)[None, :]
@@ -918,7 +923,7 @@ def flash_paged_attention(
     )
 
     assert prior_mask.shape[-1] == (num_large_k_tile * LARGE_TILE_SZ), (
-        f"unexpected prior_mask shape: {prior_mask.shape=}, {num_large_k_tile=}")
+        f"unexpected prior_mask shape: {prior_mask.shape=}, {num_large_k_tile=}, {context_kv_len=}, {num_active_blocks=}, {block_tables.shape=}")
     for large_k_tile_idx in nl.sequential_range(0, num_large_k_tile):
         cur_mask = nl.load(prior_mask[
             nl.ds(0, B_P_SIZE),
@@ -1182,7 +1187,7 @@ def flash_attn_varlen_func(
     num_seqs,
 
     block_tables,
-    softmax_scale=None,
+    softmax_scale,
 ):
     """
     Compute flash paged attention for variable length sequences.
@@ -1201,19 +1206,20 @@ def flash_attn_varlen_func(
     """
     N, _, n_kv_head, _, _ = kv_cache.shape
     assert N == 2, f"invalid {kv_cache.shape=}"
+    assert block_tables.shape[0] == 128, f"invalid block_tables shape: {block_tables.shape=}"
 
     o = flash_paged_attention[1, n_kv_head](
-        query=query,
-        key=key,
-        value=value,
-        kv_cache=kv_cache,
-        cu_seqlens_q=cu_seqlens_q,
-        cu_seqlens_k=cu_seqlens_k,
-        seqused_k=seqused_k,
-        max_seqlen_q=max_seqlen_q, max_seqlen_k=max_seqlen_k,
-        num_seqs=num_seqs,
-        block_tables=block_tables,
-        softmax_scale=softmax_scale,
+        query,
+        key,
+        value,
+        kv_cache,
+        cu_seqlens_q,
+        cu_seqlens_k,
+        seqused_k,
+        max_seqlen_q, max_seqlen_k,
+        num_seqs,
+        block_tables,
+        softmax_scale,
     )
     return o
 

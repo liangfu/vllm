@@ -28,7 +28,7 @@ def neuron_paged_attn(
 
     from vllm.attention.ops.nki_flash_attn import flash_attn_varlen_func
 
-    _, _, _, block_size, _ = kv_cache.shape
+    _, _, _, block_size, head_size = kv_cache.shape
 
     # block-aligned k/v lengths
     # [3, 5, 4, 0] -(divide)-> [1, 2, 1, 0] -(multiply)-> [4, 8, 4, 0]
@@ -40,15 +40,16 @@ def neuron_paged_attn(
 
     # build active block table
     # TODO(liangfu): move this implementation into NKI kernel
-    active_block_table = torch.tensor([], dtype=torch.int32, device=context_lens.device)
-    print(f"neuron_attn.py: {block_tables.shape=}")
-    print(f"{num_blocks_per_seq=}")
-    print(f"{num_seqs=}")
+    num_blocks = 2048 // block_size
+    active_block_table = torch.zeros(num_blocks * 2, dtype=torch.int32, device=context_lens.device)
+    indices = torch.arange(num_blocks, device=context_lens.device)
+    offset = torch.tensor(0, dtype=torch.int32, device=context_lens.device)  # Start after the initial zeros
     for seq_idx in range(num_seqs):
-        active_block_table = torch.cat((active_block_table, block_tables[seq_idx, :num_blocks_per_seq[seq_idx]]), dim=0)
-    num_blocks = active_block_table.numel()
-    active_block_table = F.pad(active_block_table, (0, round_up(num_blocks, B_P_SIZE)-num_blocks), "constant", 0).to(dtype=torch.int32)
-    print(f"{active_block_table.shape=}")
+        blocks_for_seq = num_blocks_per_seq[seq_idx]
+        active_block_table.index_put_((indices[:blocks_for_seq] + offset,), block_tables[seq_idx, :blocks_for_seq])
+        offset += blocks_for_seq
+    active_block_table = active_block_table[:num_blocks]
+    assert active_block_table.shape[0] == 128, f"invalid active_blocks_table shape: {active_block_table.shape=}"
 
     max_seqlen_q = 128
     max_seqlen_k = round_up(num_blocks * block_size, 2048)
@@ -65,8 +66,9 @@ def neuron_paged_attn(
         max_seqlen_q=max_seqlen_q,
         max_seqlen_k=max_seqlen_k,
         num_seqs=num_seqs,
+        softmax_scale=1.0 / (head_size**0.5),
     )
-    print(f"{output.shape=}")
+
     return output
 
 
@@ -176,7 +178,6 @@ class NeuronAttentionBackendImpl(AttentionImpl[NeuronAttentionMetadata]):
     ) -> torch.Tensor:
         from vllm.attention.ops.nki_flash_attn import reshape_and_cache
 
-        print(f"{query.shape=}, {key.shape=}, {value.shape=}")
         num_tokens = query.shape[-2]
         key = key.view(num_tokens, self.num_kv_heads, self.head_size)
         value = value.view(num_tokens, self.num_kv_heads, self.head_size)
