@@ -190,28 +190,29 @@ def nki_argmax(
     batch_size, vocab_size = v1.shape
     tile_size = 2048
     n_tiles = cdiv(vocab_size, tile_size)
-    dtype = nl.float32
+    print(f"{n_tiles=}")
+    dtype = v1.dtype
 
     v2 = nl.ndarray((batch_size, 1), dtype=np.int32, buffer=nl.shared_hbm)
 
-    v3 = nl.ndarray((nl.par_dim(batch_size), n_tiles, 1), dtype=np.int32, name="", buffer=nl.sbuf)
-    v4 = nl.ndarray((nl.par_dim(batch_size), n_tiles, tile_size), dtype=dtype, name="custom-call.1.131", buffer=nl.sbuf)
-    v5 = nl.ndarray((nl.par_dim(batch_size), n_tiles, 1), dtype=dtype, name="custom-call.1.133", buffer=nl.sbuf)
-    v6 = nl.ndarray((nl.par_dim(batch_size), n_tiles, 1), dtype=dtype, name="custom-call.1.135", buffer=nl.sbuf)
-    v7 = nl.ndarray((nl.par_dim(batch_size), n_tiles, tile_size), dtype=np.int32, name="custom-call.1.137", buffer=nl.sbuf)
-    v8 = nl.ndarray((nl.par_dim(batch_size), n_tiles, tile_size), dtype=np.int32, name="custom-call.1.139", buffer=nl.sbuf)
-    v9 = nl.ndarray((nl.par_dim(batch_size), n_tiles, tile_size), dtype=np.uint8, name="custom-call.1.141", buffer=nl.sbuf)
-    v10 = nl.ndarray((nl.par_dim(batch_size), n_tiles, tile_size), dtype=np.int32, name="custom-call.1.143", buffer=nl.sbuf)
-    v11 = nl.ndarray((nl.par_dim(batch_size), n_tiles, 1), dtype=np.int32, name="custom-call.1.145", buffer=nl.sbuf)
-    v12 = nl.ndarray((nl.par_dim(batch_size), n_tiles, 1), dtype=np.int32, name="custom-call.1.147", buffer=nl.sbuf)
-    v13 = nl.ndarray((nl.par_dim(batch_size), n_tiles, 1), dtype=np.int32, name="custom-call.1.147", buffer=nl.sbuf)
-    v14 = nl.ndarray((nl.par_dim(batch_size), 1, n_tiles), dtype=dtype, name="custom-call.1.131", buffer=nl.sbuf)
-    v15 = nl.ndarray((nl.par_dim(batch_size), n_tiles, 1), dtype=np.int32, name="custom-call.1.147", buffer=nl.sbuf)
+    v3 = nl.ndarray((nl.par_dim(batch_size), n_tiles, 1), dtype=np.int32, name="v3", buffer=nl.sbuf)
+    v4 = nl.ndarray((nl.par_dim(batch_size), n_tiles, tile_size), dtype=dtype, name="v4", buffer=nl.sbuf)
+    v5 = nl.ndarray((nl.par_dim(batch_size), n_tiles, 1), dtype=dtype, name="v5", buffer=nl.sbuf)
+    v6 = nl.ndarray((nl.par_dim(batch_size), n_tiles, 1), dtype=dtype, name="v6", buffer=nl.sbuf)
+    v7 = nl.ndarray((nl.par_dim(batch_size), n_tiles, tile_size), dtype=np.int32, name="v7", buffer=nl.sbuf)
+    v8 = nl.ndarray((nl.par_dim(batch_size), n_tiles, tile_size), dtype=np.int32, name="v8", buffer=nl.sbuf)
+    v9 = nl.ndarray((nl.par_dim(batch_size), n_tiles, tile_size), dtype=np.uint8, name="v9", buffer=nl.sbuf)
+    v10 = nl.ndarray((nl.par_dim(batch_size), n_tiles, tile_size), dtype=np.int32, name="v10", buffer=nl.sbuf)
+    v11 = nl.ndarray((nl.par_dim(batch_size), n_tiles, 1), dtype=np.int32, name="v11", buffer=nl.sbuf)
+    v12 = nl.ndarray((nl.par_dim(batch_size), n_tiles, 1), dtype=np.int32, name="v12", buffer=nl.sbuf)
+    v13 = nl.ndarray((nl.par_dim(batch_size), n_tiles, 1), dtype=np.int32, name="v13", buffer=nl.sbuf)
+    v14 = nl.ndarray((nl.par_dim(batch_size), 1, n_tiles), dtype=dtype, name="v14", buffer=nl.sbuf)
+    v15 = nl.ndarray((nl.par_dim(batch_size), n_tiles, 1), dtype=np.int32, name="v15", buffer=nl.sbuf)
 
-    v3_hbm = nl.ndarray((batch_size, n_tiles), dtype=np.int32, buffer=nl.shared_hbm)
-    v12_hbm = nl.ndarray((batch_size,), dtype=np.int32, name="custom-call.1.147", buffer=nl.shared_hbm)
-    v14_hbm = nl.ndarray((batch_size, n_tiles), dtype=dtype, name="custom-call.1.131", buffer=nl.shared_hbm)
-    v15_hbm = nl.ndarray((batch_size, n_tiles), dtype=np.int32, buffer=nl.shared_hbm)
+    v3_hbm = nl.ndarray((batch_size, n_tiles), dtype=np.int32, name="v3_hbm", buffer=nl.shared_hbm)
+    v12_hbm = nl.ndarray((batch_size,), dtype=np.int32, name="v12_hbm", buffer=nl.shared_hbm)
+    v14_hbm = nl.ndarray((batch_size, n_tiles), dtype=dtype, name="v14_hbm", buffer=nl.shared_hbm)
+    v15_hbm = nl.ndarray((batch_size, n_tiles), dtype=np.int32, name="v15_hbm", buffer=nl.shared_hbm)
 
     i_p = nl.arange(batch_size)[:, None, None]
     i_f = nl.arange(tile_size)[None, None, :]
@@ -225,19 +226,19 @@ def nki_argmax(
         v6[i_p, tile_idx, 0] = nisa.tensor_scalar(data=v5[i_p, tile_idx, 0], op0=nl.maximum, operand0=-np.inf, reverse0=False, dtype=dtype, mask=None)
         v7[i_p, tile_idx, i_f] = nl.broadcast_to(iota, shape=(batch_size, 1, tile_size))
         v8[i_p, tile_idx, i_f] = nisa.tensor_scalar(data=v7[i_p, tile_idx, i_f], op0=nl.subtract, operand0=tile_size, reverse0=True, dtype=np.int32, mask=None)
-        v9[i_p, tile_idx, i_f] = nisa.tensor_scalar(data=v4[i_p, tile_idx, i_f], op0=nl.equal, operand0=v6[i_p, tile_idx, 0], reverse0=False, dtype=np.uint8, mask=None)
+        v9[i_p, tile_idx, i_f] = nisa.tensor_tensor(data1=v4[i_p, tile_idx, i_f], data2=v6[i_p, tile_idx, 0], op=nl.equal)
         v10[i_p, tile_idx, i_f] = nl.multiply(v8[i_p, tile_idx, i_f], v9[i_p, tile_idx, i_f], mask=None, dtype=np.int32)
         v11[i_p, tile_idx, 0] = nisa.tensor_reduce(nl.maximum, data=v10[i_p, tile_idx, i_f], mask=None, axis=[2], dtype=np.int32, negate=False)
         v12[i_p, tile_idx, 0] = nisa.tensor_scalar(data=v11[i_p, tile_idx, 0],  op0=nl.maximum, operand0=-np.inf, reverse0=False, op1=nl.subtract, operand1=tile_size, reverse1=True, dtype=np.int32, mask=None)
         v3[i_p, tile_idx, 0] = nl.copy(v12[i_p, tile_idx, 0], dtype=np.int32, mask=None)
         nl.store(v3_hbm[i_p, tile_idx], value=v3[i_p, tile_idx, 0], mask=None)
-        v13[i_p, tile_idx, 0] = nisa.tensor_scalar(data=iota[0, 0, tile_idx],  op0=nl.multiply, operand0=tile_size, reverse0=False)
-        v15[i_p, tile_idx, 0] = nisa.tensor_scalar(data=v12[i_p, tile_idx, 0],  op0=nl.add, operand0=v13[i_p, tile_idx, 0], reverse0=False)
+        v13[i_p, tile_idx, 0] = nisa.tensor_scalar(data=v7[i_p, 0, tile_idx],  op0=nl.multiply, operand0=tile_size, dtype=np.int32, reverse0=False)
+        v15[i_p, tile_idx, 0] = nisa.tensor_tensor(data1=v12[i_p, tile_idx, 0],  data2=v13[i_p, tile_idx, 0], op=nl.add)
         nl.store(v15_hbm[i_p, tile_idx], value=v15[i_p, tile_idx, 0], mask=None)
 
-    for tile_idx in nl.affine_range(n_tiles):
-        for batch_idx in nl.affine_range(batch_size):
-            v14[batch_idx, 0, tile_idx] = nisa.tensor_copy_dynamic_src(v4[batch_idx, tile_idx, v3[batch_idx, tile_idx, 0]], dtype=dtype, mask=None)
+    for batch_idx in nl.affine_range(batch_size):
+        for tile_idx in nl.affine_range(n_tiles):
+            v14[batch_idx, 0, tile_idx] = nl.load(v1[batch_idx, v15[batch_idx, tile_idx, 0]], dtype=dtype, mask=None)
 
     i_b = nl.arange(n_tiles)[None, :, None]
     i_f = nl.arange(n_tiles)[None, None, :]
@@ -246,14 +247,16 @@ def nki_argmax(
     v6[i_p, 0, 0] = nisa.tensor_scalar(data=v5[i_p, 0, 0], op0=nl.maximum, operand0=-np.inf, reverse0=False, dtype=dtype, mask=None)
     v7[i_p, 0, i_f] = nl.broadcast_to(nisa.iota(i_f, dtype=np.int32, mask=None), shape=(batch_size, 1, n_tiles))
     v8[i_p, 0, i_f] = nisa.tensor_scalar(data=v7[i_p, 0, i_f], op0=nl.subtract, operand0=n_tiles, reverse0=True, dtype=np.int32, mask=None)
-    v9[i_p, 0, i_f] = nisa.tensor_scalar(data=v14[i_p, 0, i_f], op0=nl.equal, operand0=v6[i_p, 0, 0], reverse0=False, dtype=np.uint8, mask=None)
+    v9[i_p, 0, i_f] = nisa.tensor_tensor(data1=v14[i_p, 0, i_f], data2=v6[i_p, 0, 0], op=nl.equal)
     v10[i_p, 0, i_f] = nl.multiply(v8[i_p, 0, i_f], v9[i_p, 0, i_f], mask=None, dtype=np.int32)
     v11[i_p, 0, 0] = nisa.tensor_reduce(nl.maximum, data=v10[i_p, 0, i_f], mask=None, axis=[2], dtype=np.int32, negate=False)
     v12[i_p, 0, 0] = nisa.tensor_scalar(data=v11[i_p, 0, 0],  op0=nl.maximum, operand0=-np.inf, reverse0=False, op1=nl.subtract, operand1=n_tiles, reverse1=True, dtype=np.int32, mask=None)
     nl.store(v12_hbm[i_p], value=v12[i_p, 0, 0], mask=None)
-    for batch_idx in nl.affine_range(batch_size):
-        nl.store(v2[batch_idx, 0], nisa.tensor_copy_dynamic_src(v15[batch_idx, v12[batch_idx, 0, 0], 0]))
 
+    for batch_idx in nl.affine_range(batch_size):
+        nl.store(v2[batch_idx, 0], nl.load(v15_hbm[batch_idx, v12[batch_idx, 0, 0]]))
+
+    #return v2, v3_hbm, v12_hbm, v14_hbm, v15_hbm
     return v2
 
 @torch.library.custom_op("vllm::neuron_argmax", mutates_args=())
@@ -266,5 +269,5 @@ def _(
     input: torch.Tensor,
 ) -> torch.Tensor:
     batch_size, vocab_size = input.shape
-    return torch.empty((batch_size, 1), dtype=input.dtype)
+    return torch.empty((batch_size, 1), dtype=torch.int32)
 
