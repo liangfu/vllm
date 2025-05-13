@@ -37,7 +37,7 @@ def neuron_paged_attn(
                         dtype=context_lens.dtype,
                         device=context_lens.device)
     cu_ctx_lens_blockaligned = (torch.cat(
-        (zero, context_lens), dim=0) * block_size).cumsum(dim=0)
+        (zero, num_blocks_per_seq), dim=0) * block_size).cumsum(dim=0)
 
     # build active block table
     # TODO(liangfu): move this implementation into NKI kernel

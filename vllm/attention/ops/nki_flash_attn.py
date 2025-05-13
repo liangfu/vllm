@@ -650,8 +650,8 @@ def build_attention_mask(
 
 
     # only reorder cached token mask
-    # if not contexted:
-    #     transpose_kv_token_mask(prior_mask, tiled_block_size)
+    if not contexted:
+        transpose_kv_token_mask(prior_mask, tiled_block_size)
 
     # nl.store(iota_hbm[0, :, :], a)
     # nl.store(iota_hbm[1, :, :], b)
@@ -701,7 +701,7 @@ import uuid
 #                debug_kernel=True,
 #                show_compiler_tb=True,
 # )
-@nki.jit
+@nki.jit(debug_kernel=True)
 def flash_paged_attention(
     query,
     key,
@@ -1130,7 +1130,7 @@ def flash_paged_attention(
 
     if return_debug_tensors:
         return o, hbm_m_buffer, hbm_l_buffer, hbm_qk_res
-    return o
+    return o, prior_mask, active_mask
 
 
 def reorder_context_mask(mask, LARGE_TILE_SZ, block_size):
@@ -1209,7 +1209,7 @@ def flash_attn_varlen_func(
     assert N == 2, f"invalid {kv_cache.shape=}"
     assert block_tables.shape[0] == 128, f"invalid block_tables shape: {block_tables.shape=}"
 
-    o = flash_paged_attention[1, n_kv_head](
+    o, *debug_tensors = flash_paged_attention[1, n_kv_head](
         query,
         key,
         value,
@@ -1222,7 +1222,7 @@ def flash_attn_varlen_func(
         block_tables,
         softmax_scale,
     )
-    return o
+    return o, *debug_tensors
 
 
 def reshape_and_cache(
