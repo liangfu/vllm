@@ -195,6 +195,8 @@ class NeuronAttentionBackendImpl(AttentionImpl[NeuronAttentionMetadata]):
         key = key.unsqueeze(0).permute(0, 2, 3, 1).contiguous()
         value = value.unsqueeze(0).permute(0, 2, 1, 3).contiguous()
 
+        print(f"neuron_attn.py: {query.shape=}, {key.shape=}, {value.shape=}, {slot_mapping.shape=}")
+        print(f"neuron_attn.py: {attn_metadata=}, {query.sum()=}, {key.sum()=}, {value.sum()=}, {query.max()=}, {key.max()=}, {value.max()=}, {query=}, {key=}, {value=}")
         output = neuron_paged_attn(
             query,
             key,
@@ -205,6 +207,7 @@ class NeuronAttentionBackendImpl(AttentionImpl[NeuronAttentionMetadata]):
             attn_metadata.query_start_loc,
             attn_metadata.num_seqs,
         )
+        print(f"neuron_attn.py: {output.sum()=}, {output.max()=}, {output=}")
         output = output.transpose(1, 2).reshape(
-            1, num_tokens, self.num_heads * self.head_size)
+            num_tokens, self.num_heads * self.head_size)
         return output

@@ -51,7 +51,7 @@ LARGE_TILE_SZ = 2048
 
 # Here we utilize the behavior that out-of-bound index is ignored.
 # FIXME(woosuk): Find a more reliable way to prevent possible bugs.
-_PAD_SLOT_ID = -1
+_PAD_SLOT_ID = 0
 INVALID_TOKEN_ID = -1
 # Smallest output size
 MIN_NUM_SEQS = 8
@@ -206,7 +206,7 @@ class NeuronModelRunner:
             (self.max_num_reqs, self.max_num_blocks_per_req),
             dtype=self.input_batch.block_table.get_cpu_tensor().dtype,
             device="cpu")
-        print(f"{self.block_table_cpu.shape=}")
+        # print(f"{self.block_table_cpu.shape=}")
 
         self.query_start_loc_cpu = torch.zeros(self.max_num_tokens + 1,
                                                dtype=torch.int32,
@@ -526,12 +526,16 @@ class NeuronModelRunner:
         np.add(block_numbers * self.block_size,
                block_offsets,
                out=self.slot_mapping_np[:total_num_scheduled_tokens])
+        print(f"{self.slot_mapping_np[:total_num_scheduled_tokens]=}")
+        print(f"{self.slot_mapping_cpu[:total_num_scheduled_tokens]=}")
 
         # Prepare the attention metadata.
         self.query_start_loc_np[0] = 0
         np.cumsum(num_scheduled_tokens_per_req,
                   out=self.query_start_loc_np[1:num_reqs + 1])
-        self.query_start_loc_np[num_reqs + 1:] = 1
+        # self.query_start_loc_np[num_reqs + 1:] = 1
+        self.query_start_loc_np[num_reqs + 1:] = self.query_start_loc_np.max()
+
 
         self.seq_lens_np[:num_reqs] = (
             self.input_batch.num_computed_tokens_cpu[:num_reqs] +
@@ -776,13 +780,13 @@ class NeuronModelRunner:
         # Prepare inputs
         attn_metadata, logits_indices, padded_num_reqs = self._prepare_inputs(
             scheduler_output)
-        print(f"{attn_metadata=}, {logits_indices=}, {padded_num_reqs=}")
+        # print(f"{attn_metadata=}, {logits_indices=}, {padded_num_reqs=}")
         input_ids, inputs_embeds = self._get_model_inputs(
             self.input_ids, mm_embeds)
         xm.mark_step()
         num_reqs = self.input_batch.num_reqs
-        print(f"{input_ids=}, {inputs_embeds=}, {num_reqs=}, {scheduler_output.total_num_scheduled_tokens=}")
-        print(f"{self.position_ids=}")
+        # print(f"{input_ids=}, {inputs_embeds=}, {num_reqs=}, {scheduler_output.total_num_scheduled_tokens=}")
+        # print(f"{self.position_ids=}")
         # Run the decoder
         with set_forward_context(attn_metadata, self.vllm_config,
                                  num_tokens=scheduler_output.total_num_scheduled_tokens):
@@ -793,7 +797,9 @@ class NeuronModelRunner:
             )
         hidden_states = self.select_hidden_states(hidden_states,
                                                   logits_indices)
+        # print(f"neuron_model_runner.py: {hidden_states.shape=}")
         logits = self.compute_logits(hidden_states)
+        # print(f"neuron_model_runner.py: {logits.shape=}")
         neuron_sampling_metadata = NeuronSupportedSamplingMetadata.\
             from_input_batch(self.input_batch, padded_num_reqs, self.device)
         if scheduler_output.grammar_bitmask is not None:
@@ -894,10 +900,10 @@ class NeuronModelRunner:
             model = model.eval().to(self.device)
             xm.mark_step()
             xm.wait_device_ops()
-            self.model = torch.compile(
-                model, backend="openxla", fullgraph=True, dynamic=False)
             # self.model = torch.compile(
-            #     model, backend="eager", dynamic=False) # debugging only
+            #     model, backend="openxla", fullgraph=True, dynamic=False)
+            self.model = torch.compile(
+                model, backend="eager", dynamic=False) # debugging only
             self.sampler = NeuronSampler()
 
     @torch.inference_mode()
@@ -924,7 +930,7 @@ class NeuronModelRunner:
             dtype=torch.int32,
             device=self.device)
         num_seqs = actual_num_reqs # torch.tensor([actual_num_reqs], dtype=torch.int32, device=self.device)
-        print(f"_dummy_run: {block_tables.shape=}, {slot_mapping.shape=}, {context_lens.shape=}, {query_start_loc.shape=}, {num_seqs=}")
+        # print(f"_dummy_run: {block_tables.shape=}, {slot_mapping.shape=}, {context_lens.shape=}, {query_start_loc.shape=}, {num_seqs=}")
 
         attn_metadata = NeuronAttentionMetadata(
             block_tables=block_tables,
@@ -1035,7 +1041,7 @@ class NeuronModelRunner:
         """
         Precompile all the subgraphs with possible input shapes.
         """
-        self._precompile_backbone()
+        # self._precompile_backbone()
         self._precompile_select_hidden_states()
         self._precompile_compute_logits()
         self._precompile_sample_from_logits()
@@ -1117,6 +1123,7 @@ class NeuronModelRunner:
             self, logits: torch.Tensor,
             sampling_metadata: NeuronSupportedSamplingMetadata) -> torch.Tensor:
         if sampling_metadata.all_greedy:
+            # print(f"neuron_model_runner.py: sample_from_logits(): {logits.shape}")
             out_tokens = neuron_argmax(logits)
             # from torch_neuronx.xla_impl.ops import Argmax
             # return Argmax.apply(logits, dim=-1, keepdim=True)
