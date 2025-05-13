@@ -222,7 +222,7 @@ def sample_inputs(
                           dtype=dtype)
     k = torch.zeros(sum(query_lens), num_kv_heads, head_size, dtype=dtype)
     v = torch.zeros(sum(query_lens), num_kv_heads, head_size, dtype=dtype)
-    values = torch.arange(0, cache_size, dtype=torch.long)
+    values = torch.arange(0, cache_size, dtype=torch.int32)
     values = values[torch.randperm(cache_size)]
     block_table = values[:batch_size * max_block_per_request].view(
         batch_size, max_block_per_request)
@@ -301,7 +301,7 @@ def get_active_block_tables(block_tables, query_lens, seq_lens, block_size,
         # (1, 199, 1, 512, 4, 2, 8, True),  # same with mixed precision
 
         # Test common/medium configurations
-        (3, 5, 4, 1024, 4, 2, 4, True),  # common case, larger heads
+        (3, 5, 16, 2048, 4, 2, 4, True),  # common case, larger heads
         # (4, 12, 32, 2048, 16, 4, 32,
         #  True),  # medium size, mixed precision, grouped-query attention (GQA)
 
@@ -362,7 +362,7 @@ def test_contexted_kv_attention(
         k_active,
         v_active,
         kv_cache,
-        block_table,
+        block_tables,
         key,
         value,
         query_lens,
@@ -451,11 +451,26 @@ def test_contexted_kv_attention(
     cu_ctx_lens = torch.tensor([0] + ctx_lens,
                                dtype=torch.int32).cumsum(dim=0,
                                                          dtype=torch.int32)
-    num_seqs = torch.tensor([prefill_batch_size + decode_batch_size], dtype=torch.int32)
+    # num_seqs = torch.tensor([prefill_batch_size + decode_batch_size], dtype=torch.int32)
+    num_seqs = prefill_batch_size + decode_batch_size
+
+    # build active block table
+    # TODO(liangfu): move this implementation into NKI kernel
+    num_blocks = 2048 // block_size
+    num_blocks_per_seq = (context_lens + block_size - 1) // block_size
+    active_block_table = torch.zeros(num_blocks * 2, dtype=torch.int32, device=context_lens.device)
+    indices = torch.arange(num_blocks, dtype=torch.int32, device=context_lens.device)
+    offset = torch.tensor(0, dtype=torch.int32, device=context_lens.device)  # Start after the initial zeros
+    for seq_idx in range(num_seqs):
+        blocks_for_seq = num_blocks_per_seq[seq_idx]
+        active_block_table.index_put_((indices[:blocks_for_seq] + offset,), block_tables[seq_idx, :blocks_for_seq])
+        offset += blocks_for_seq
+    active_block_table = active_block_table[:num_blocks]
+    assert active_block_table.shape[0] == 128, f"invalid active_blocks_table shape: {active_block_table.shape=}"
 
     def to_device(x):
-        return x.numpy()
-        # return x.to(device=device)
+        # return x.numpy()
+        return x.to(device=device)
 
     input_args = (
         to_device(query),
@@ -467,8 +482,11 @@ def test_contexted_kv_attention(
         cu_seqlens_q=to_device(cu_query_lens),
         cu_seqlens_k=to_device(cu_ctx_lens),
         seqused_k=to_device(seqused_k),
-        num_seqs=to_device(num_seqs),
-        block_table=to_device(block_table),
+        max_seqlen_q=max_seqlen_q,
+        max_seqlen_k=max_seqlen_k,
+        num_seqs=num_seqs,
+        block_tables=to_device(active_block_table),
+        softmax_scale=1.0 / (head_size**0.5),
     )
     print(f"{input_kwargs=}")
 
