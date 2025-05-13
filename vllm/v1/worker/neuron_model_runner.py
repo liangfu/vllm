@@ -3,7 +3,6 @@ import bisect
 import gc
 import time
 from typing import TYPE_CHECKING, Optional, cast
-from unittest.mock import patch
 
 import numpy as np
 import torch
@@ -22,8 +21,7 @@ from vllm.forward_context import set_forward_context
 from vllm.logger import init_logger
 from vllm.model_executor.model_loader import get_model
 from vllm.multimodal import MULTIMODAL_REGISTRY
-from vllm.multimodal.inputs import (BatchedTensorInputs, MultiModalKwargs,
-                                    PlaceholderRange)
+from vllm.multimodal.inputs import MultiModalKwargs, PlaceholderRange
 from vllm.multimodal.utils import group_mm_inputs_by_modality
 from vllm.sequence import IntermediateTensors
 from vllm.utils import LayerBlockType, cdiv, is_pin_memory_available
@@ -36,8 +34,8 @@ from vllm.v1.kv_cache_interface import (AttentionSpec, FullAttentionSpec,
 from vllm.v1.outputs import (EMPTY_MODEL_RUNNER_OUTPUT, LogprobsTensors,
                              ModelRunnerOutput)
 from vllm.v1.sample.neuron.metadata import NeuronSupportedSamplingMetadata
-from vllm.v1.sample.neuron.sampler import neuron_argmax
 from vllm.v1.sample.neuron.sampler import Sampler as NeuronSampler
+from vllm.v1.sample.neuron.sampler import neuron_argmax
 from vllm.v1.utils import bind_kv_cache
 from vllm.v1.worker.gpu_input_batch import CachedRequestState, InputBatch
 
@@ -455,7 +453,6 @@ class NeuronModelRunner:
         return kv_cache_spec
 
     def _prepare_inputs(self, scheduler_output: "SchedulerOutput"):
-        from vllm.attention.ops.nki_flash_attn import reorder_context_mask
 
         total_num_scheduled_tokens = scheduler_output.total_num_scheduled_tokens
         assert total_num_scheduled_tokens > 0
@@ -536,7 +533,6 @@ class NeuronModelRunner:
         # self.query_start_loc_np[num_reqs + 1:] = 1
         self.query_start_loc_np[num_reqs + 1:] = self.query_start_loc_np.max()
 
-
         self.seq_lens_np[:num_reqs] = (
             self.input_batch.num_computed_tokens_cpu[:num_reqs] +
             num_scheduled_tokens_per_req)
@@ -590,7 +586,8 @@ class NeuronModelRunner:
             block_tables=block_tables,
             context_lens=context_lens,
             query_start_loc=query_start_loc,
-            num_seqs=num_reqs, # torch.tensor([num_reqs], dtype=torch.int32, device=self.device),
+            num_seqs=
+            num_reqs,  # torch.tensor([num_reqs], dtype=torch.int32, device=self.device),
         )
 
         # NOTE(woosuk): Due to chunked prefills, there can be at most 1 partial
@@ -788,8 +785,10 @@ class NeuronModelRunner:
         # print(f"{input_ids=}, {inputs_embeds=}, {num_reqs=}, {scheduler_output.total_num_scheduled_tokens=}")
         # print(f"{self.position_ids=}")
         # Run the decoder
-        with set_forward_context(attn_metadata, self.vllm_config,
-                                 num_tokens=scheduler_output.total_num_scheduled_tokens):
+        with set_forward_context(
+                attn_metadata,
+                self.vllm_config,
+                num_tokens=scheduler_output.total_num_scheduled_tokens):
             hidden_states = self.model(
                 input_ids=input_ids,
                 positions=self.position_ids,
@@ -902,8 +901,8 @@ class NeuronModelRunner:
             xm.wait_device_ops()
             # self.model = torch.compile(
             #     model, backend="openxla", fullgraph=True, dynamic=False)
-            self.model = torch.compile(
-                model, backend="eager", dynamic=False) # debugging only
+            self.model = torch.compile(model, backend="eager",
+                                       dynamic=False)  # debugging only
             self.sampler = NeuronSampler()
 
     @torch.inference_mode()
@@ -929,7 +928,7 @@ class NeuronModelRunner:
             (self.max_num_reqs, self.block_table_cpu.shape[1]),
             dtype=torch.int32,
             device=self.device)
-        num_seqs = actual_num_reqs # torch.tensor([actual_num_reqs], dtype=torch.int32, device=self.device)
+        num_seqs = actual_num_reqs  # torch.tensor([actual_num_reqs], dtype=torch.int32, device=self.device)
         # print(f"_dummy_run: {block_tables.shape=}, {slot_mapping.shape=}, {context_lens.shape=}, {query_start_loc.shape=}, {num_seqs=}")
 
         attn_metadata = NeuronAttentionMetadata(
@@ -948,9 +947,11 @@ class NeuronModelRunner:
             inputs_embeds = None
         with set_forward_context(attn_metadata, self.vllm_config):
             hidden_states = self.model(
-                input_ids=input_ids.to(self.device) if input_ids is not None else None,
+                input_ids=input_ids.to(self.device)
+                if input_ids is not None else None,
                 positions=self.positions_cpu[:num_tokens].to(self.device),
-                inputs_embeds=inputs_embeds.to(self.device) if inputs_embeds is not None else None,
+                inputs_embeds=inputs_embeds.to(self.device)
+                if inputs_embeds is not None else None,
             )
         return hidden_states
 
@@ -1121,7 +1122,8 @@ class NeuronModelRunner:
     @torch.compile(backend="openxla", fullgraph=True, dynamic=False)
     def sample_from_logits(
             self, logits: torch.Tensor,
-            sampling_metadata: NeuronSupportedSamplingMetadata) -> torch.Tensor:
+            sampling_metadata: NeuronSupportedSamplingMetadata
+    ) -> torch.Tensor:
         if sampling_metadata.all_greedy:
             # print(f"neuron_model_runner.py: sample_from_logits(): {logits.shape}")
             out_tokens = neuron_argmax(logits)
@@ -1142,7 +1144,6 @@ class NeuronModelRunner:
                 padded_size = ((size + B_P_SIZE - 1) // B_P_SIZE) * B_P_SIZE
                 return padded_size
         return None
-
 
 
 def shift_bit_length(x):

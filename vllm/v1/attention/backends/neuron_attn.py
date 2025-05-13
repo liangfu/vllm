@@ -3,15 +3,15 @@ from dataclasses import dataclass
 from typing import Any, Optional
 
 import torch
-import torch.nn.functional as F
 
-from vllm.utils import round_up, cdiv
 from vllm.attention.backends.abstract import (AttentionBackend, AttentionImpl,
                                               AttentionMetadataBuilder,
                                               AttentionType)
 from vllm.attention.backends.utils import CommonAttentionState
+from vllm.utils import round_up
 
 B_P_SIZE = 128
+
 
 @torch.library.custom_op("vllm::neuron_paged_attn", mutates_args=())
 def neuron_paged_attn(
@@ -33,23 +33,30 @@ def neuron_paged_attn(
     # block-aligned k/v lengths
     # [3, 5, 4, 0] -(divide)-> [1, 2, 1, 0] -(multiply)-> [4, 8, 4, 0]
     num_blocks_per_seq = (context_lens + block_size - 1) // block_size
-    zero = torch.tensor([0], dtype=context_lens.dtype, device=context_lens.device)
-    cu_ctx_lens_blockaligned = (
-        torch.cat((zero, context_lens), dim=0) * block_size
-    ).cumsum(dim=0)
+    zero = torch.tensor([0],
+                        dtype=context_lens.dtype,
+                        device=context_lens.device)
+    cu_ctx_lens_blockaligned = (torch.cat(
+        (zero, context_lens), dim=0) * block_size).cumsum(dim=0)
 
     # build active block table
     # TODO(liangfu): move this implementation into NKI kernel
     num_blocks = 2048 // block_size
-    active_block_table = torch.zeros(num_blocks * 2, dtype=torch.int32, device=context_lens.device)
+    active_block_table = torch.zeros(num_blocks * 2,
+                                     dtype=torch.int32,
+                                     device=context_lens.device)
     indices = torch.arange(num_blocks, device=context_lens.device)
-    offset = torch.tensor(0, dtype=torch.int32, device=context_lens.device)  # Start after the initial zeros
+    offset = torch.tensor(
+        0, dtype=torch.int32,
+        device=context_lens.device)  # Start after the initial zeros
     for seq_idx in range(num_seqs):
         blocks_for_seq = num_blocks_per_seq[seq_idx]
-        active_block_table.index_put_((indices[:blocks_for_seq] + offset,), block_tables[seq_idx, :blocks_for_seq])
+        active_block_table.index_put_((indices[:blocks_for_seq] + offset, ),
+                                      block_tables[seq_idx, :blocks_for_seq])
         offset += blocks_for_seq
     active_block_table = active_block_table[:num_blocks]
-    assert active_block_table.shape[0] == 128, f"invalid active_blocks_table shape: {active_block_table.shape=}"
+    assert active_block_table.shape[
+        0] == 128, f"invalid active_blocks_table shape: {active_block_table.shape=}"
 
     max_seqlen_q = 128
     max_seqlen_k = round_up(num_blocks * block_size, 2048)
@@ -195,8 +202,12 @@ class NeuronAttentionBackendImpl(AttentionImpl[NeuronAttentionMetadata]):
         key = key.unsqueeze(0).permute(0, 2, 3, 1).contiguous()
         value = value.unsqueeze(0).permute(0, 2, 1, 3).contiguous()
 
-        print(f"neuron_attn.py: {query.shape=}, {key.shape=}, {value.shape=}, {slot_mapping.shape=}")
-        print(f"neuron_attn.py: {attn_metadata=}, {query.sum()=}, {key.sum()=}, {value.sum()=}, {query.max()=}, {key.max()=}, {value.max()=}, {query=}, {key=}, {value=}")
+        print(
+            f"neuron_attn.py: {query.shape=}, {key.shape=}, {value.shape=}, {slot_mapping.shape=}"
+        )
+        print(
+            f"neuron_attn.py: {attn_metadata=}, {query.sum()=}, {key.sum()=}, {value.sum()=}, {query.max()=}, {key.max()=}, {value.max()=}, {query=}, {key=}, {value=}"
+        )
         output = neuron_paged_attn(
             query,
             key,
@@ -208,6 +219,7 @@ class NeuronAttentionBackendImpl(AttentionImpl[NeuronAttentionMetadata]):
             attn_metadata.num_seqs,
         )
         print(f"neuron_attn.py: {output.sum()=}, {output.max()=}, {output=}")
-        output = output.transpose(1, 2).reshape(
-            num_tokens, self.num_heads * self.head_size)
+        output = output.transpose(1,
+                                  2).reshape(num_tokens,
+                                             self.num_heads * self.head_size)
         return output
