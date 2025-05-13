@@ -1,14 +1,21 @@
 import numpy as np
 import pytest
 
+import neuronxcc.nki.language as nl
+from neuronxcc import nki
+import neuronxcc.nki.typing as nt
+
+from vllm.attention.ops.nki_flash_attn import build_attention_mask
 
 @pytest.mark.parametrize("query_lens,seq_lens", [
     ([2, 3, 1, 0], [4, 8, 4, 0]),
 ])
 def test_context_mask(query_lens, seq_lens) -> None:
 
-    max_query_lens = 8
-    max_seq_lens = 20
+    # max_query_lens = 8
+    # max_seq_lens = 20
+    max_query_lens = 128
+    max_seq_lens = 512
     max_num_seqs = 4
     block_size = 4
 
@@ -27,7 +34,6 @@ def test_context_mask(query_lens, seq_lens) -> None:
     expected = (
         # prior_mask
         np.array(
-            [
                 [
                     # i0, 1, 2, 3, 4, 5, 6, 7, 8, 9,10,11,12,13,14,15,16,17,18,19
                     # c0,c0,p0,p0,c1,c1,c1,c1,c1,p1,p1,p1,c2,c2,c2,p2,p3,p3,p3,p3 - (c - cached token, n - new token, p - padding)
@@ -64,12 +70,10 @@ def test_context_mask(query_lens, seq_lens) -> None:
                         0, 0
                     ],  # padding
                 ],
-            ],
             dtype=np.int32),
 
         # active_mask
         np.array(
-            [
                 [
                     # i0, 1, 2, 3, 4, 5, 6, 7
                     # n0,n0,n1,n1,n1,n2,p3,p3 - (c - cached token, n - new token, p - padding)
@@ -82,72 +86,74 @@ def test_context_mask(query_lens, seq_lens) -> None:
                     [0, 0, 0, 0, 0, 0, 0, 0],  # padding
                     [0, 0, 0, 0, 0, 0, 0, 0],  # padding
                 ],
-            ],
             dtype=np.int32))
 
     print(
-        f"{cu_query_lens=}, {cu_ctx_lens_blockaligned=}, {seq_lens=}, {max_query_lens=}, {max_seq_lens=}, {max_num_seqs=}"
+        f"{cu_query_lens=}, {cu_ctx_lens_blockaligned=}, {seq_lens=}, "
+        f"{max_query_lens=}, {max_seq_lens=}, {max_num_seqs=}"
     )
 
-    prior_mask = flash_paged_attention(
-        cu_seqlens_q=cu_query_lens.astype(np.int32),
-        cu_seqlens_k=cu_ctx_lens_blockaligned.astype(np.int32),
-        seqused_k=np.array(ctx_lens).astype(np.int32),
-        max_seqlen_q=max_query_lens,
-        max_seqlen_k=max_seq_lens,
-        block_size=block_size,
+    ref_prior_mask, ref_active_mask = expected
+    pnr, pnc = ref_prior_mask.shape
+    anr, anc = ref_active_mask.shape
+
+    block_size_tiling_factor = 1
+    tiled_block_size = block_size // block_size_tiling_factor
+
+    prior_mask = np.zeros((max_query_lens, max_seq_lens), dtype=np.int32)
+    active_mask = np.zeros((max_query_lens, max_query_lens), dtype=np.int32)
+
+    # prior mask
+    ctx_lens = np.array(ctx_lens, dtype=np.int32)
+    build_attention_mask_wrapper(
+        prior_mask,
+        cu_query_lens, cu_ctx_lens_blockaligned, ctx_lens,
+        max_query_lens, max_seq_lens,
+        max_num_seqs=max_num_seqs, block_size=block_size,
+        tiled_block_size=tiled_block_size,
     )
+    prior_mask = prior_mask.astype(bool).astype(np.int32)
+    np.testing.assert_allclose(ref_prior_mask, prior_mask[:pnr, :pnc])
 
-    # # prior mask
-    # ctx_lens = np.array(ctx_lens, dtype=np.int32)
-    # prior_mask, *debug_tensors = build_attention_mask(
-    #     cu_query_lens, cu_ctx_lens_blockaligned, ctx_lens, max_query_lens, max_seq_lens, max_num_seqs, block_size)
-    # prior_mask = prior_mask.astype(bool).astype(np.int32)
-    # loop_var = debug_tensors[-1]
-    np.testing.assert_allclose(expected[0], prior_mask)
-
-    # # active mask
-    # query_lens = np.array(query_lens, dtype=np.int32)
-    # active_mask, *debug_tensors = build_attention_mask(
-    #     cu_query_lens, cu_query_lens, query_lens, max_query_lens, max_query_lens, max_num_seqs, block_size, contexted=True)
+    # active mask
+    query_lens = np.array(query_lens, dtype=np.int32)
+    build_attention_mask_wrapper(
+        active_mask,
+        cu_query_lens, cu_query_lens, query_lens,
+        max_query_lens, max_query_lens,
+        max_num_seqs=max_num_seqs, block_size=block_size,
+        tiled_block_size=tiled_block_size,
+        contexted=True
+    )
     active_mask = active_mask.astype(bool).astype(np.int32)
-    # loop_var = debug_tensors[-1]
-    np.testing.assert_allclose(expected[1], active_mask)
+    np.testing.assert_allclose(ref_active_mask, active_mask[:anr, :anc])
 
 
-import neuronxcc.nki.language as nl
-from neuronxcc import nki
-
-from vllm.attention.ops.nki_flash_attn import build_attention_mask
-
-
-# @nki.benchmark(artifacts_dir=f"./_artifact_{str(uuid.uuid4().hex)[:8]}", additional_compile_opt=" -O1 ")
-@nki.jit
-def flash_paged_attention(
-    cu_seqlens_q,
-    cu_seqlens_k,
-    seqused_k,
-    max_seqlen_q,
-    max_seqlen_k,
+@nki.jit(experimental_flags='enable-mutable-parameter')
+def build_attention_mask_wrapper(
+    prior_mask: nt.mutable_tensor,
+    cu_query_lens,
+    cu_ctx_lens,
+    seq_lens,
+    max_num_queries,
+    max_num_keys,
+    max_num_seqs,
     block_size,
+    tiled_block_size,
+    contexted=False,
 ):
-    max_num_seqs = cu_seqlens_q.shape[0] - 1
-
-    prior_mask = nl.ndarray((1, max_seqlen_q, max_seqlen_k),
-                            dtype=nl.bool_,
-                            buffer=nl.shared_hbm)
-    # active_mask = nl.ndarray((1, max_seqlen_q, max_seqlen_q), dtype=nl.bool_, buffer=nl.shared_hbm)
-
-    build_attention_mask(prior_mask,
-                         cu_seqlens_q,
-                         cu_seqlens_k,
-                         seqused_k,
-                         max_seqlen_q,
-                         max_seqlen_k,
-                         max_num_seqs=max_num_seqs,
-                         block_size=block_size)
-    # build_attention_mask(
-    #     active_mask, cu_seqlens_q, cu_seqlens_q, seqused_q, max_seqlen_q, max_seqlen_q,
-    #     max_num_seqs=max_seqlen_q, block_size=block_size, contexted=True)
-
+    i_p, i_f = nl.mgrid[0:1, 0:max_num_seqs]
+    seq_lens_sbuf = nl.load(seq_lens[i_f])
+    prior_mask = build_attention_mask(
+        prior_mask,
+        cu_query_lens,
+        cu_ctx_lens,
+        seq_lens_sbuf,
+        max_num_queries,
+        max_num_keys,
+        max_num_seqs,
+        block_size,
+        tiled_block_size,
+        contexted,
+    )
     return prior_mask

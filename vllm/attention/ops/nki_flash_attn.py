@@ -5,6 +5,7 @@ import neuronxcc.nki.language as nl
 import numpy as np
 import torch
 from neuronxcc import nki
+import neuronxcc.nki.typing as nt
 from neuronxcc.nki.language import par_dim
 from neuronxcc.nki.isa.constants import oob_mode
 
@@ -456,9 +457,9 @@ def load_v_tile(v_hbm_tile, cur_v_tile, large_tile_idx, v_i, LARGE_TILE_SZ):
     cur_v_tile[:, nl.ds(v_i * B_D_SIZE, B_D_SIZE)] = loaded
 
 
-@nki.jit
+@nki.jit(experimental_flags='enable-mutable-parameter')
 def build_attention_mask(
-    prior_mask,
+    prior_mask: nt.mutable_tensor,
     cu_query_lens,
     cu_ctx_lens,
     seq_lens,
@@ -911,7 +912,7 @@ def flash_paged_attention(
     i_p = nl.arange(1)[:, None]
     i_f = nl.arange(max_num_seqs)[None, :]
     seqused_k_sbuf = nl.load(seqused_k[i_f])
-    build_attention_mask(prior_mask,
+    prior_mask = build_attention_mask(prior_mask,
                          cu_seqlens_q,
                          cu_seqlens_k,
                          seqused_k_sbuf,
@@ -1009,7 +1010,7 @@ def flash_paged_attention(
     i_f = nl.arange(max_num_seqs)[None, :]
     cu_seqlens_q_sbuf = nl.load(cu_seqlens_q[cu_f])
     seqused_q = cu_seqlens_q_sbuf[i_p, i_f + 1] - cu_seqlens_q_sbuf[i_p, i_f]
-    build_attention_mask(active_mask,
+    active_mask = build_attention_mask(active_mask,
                          cu_seqlens_q,
                          cu_seqlens_q,
                          seqused_q,
