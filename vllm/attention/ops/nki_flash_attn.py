@@ -467,7 +467,7 @@ def build_attention_mask(
     max_num_keys,
     max_num_seqs,
     block_size,
-    tiled_block_size,
+    # tiled_block_size,
     contexted=False,
 ):
     """
@@ -553,7 +553,7 @@ def build_attention_mask(
     # Create mask buffers
     # prior_mask = nl.ndarray((1, max_num_queries, max_num_keys), dtype=nl.bool_, buffer=nl.shared_hbm)
 
-    q_tile_size, k_tile_size = max_num_queries, max_num_keys  # max_num_queries, 8
+    q_tile_size, k_tile_size = max_num_queries, B_F_SIZE  # max_num_queries, 8
     n_q_tile = (max_num_queries + q_tile_size - 1) // q_tile_size
     n_k_tile = (max_num_keys + k_tile_size - 1) // k_tile_size
     _print(f"{n_q_tile=}, {n_k_tile=}")
@@ -650,8 +650,8 @@ def build_attention_mask(
 
 
     # only reorder cached token mask
-    if not contexted:
-        transpose_kv_token_mask(prior_mask, tiled_block_size)
+    # if not contexted:
+    #     transpose_kv_token_mask(prior_mask, tiled_block_size)
 
     # nl.store(iota_hbm[0, :, :], a)
     # nl.store(iota_hbm[1, :, :], b)
@@ -670,7 +670,7 @@ def transpose_kv_token_mask(mask, tiled_block_size):
     size_q, size_kv = mask.shape
     assert size_kv % tiled_block_size == 0
     num_block = size_kv // tiled_block_size
-    assert num_block >= B_P_SIZE
+    assert num_block >= B_P_SIZE, f"invalid {num_block=}, {size_kv=}, {tiled_block_size=}"
     num_batch = num_block // B_P_SIZE
     _print(f"{size_q=}, {num_batch=}, {B_P_SIZE=}, {tiled_block_size=}")
     transpose_range = B_P_SIZE * tiled_block_size
@@ -791,7 +791,8 @@ def flash_paged_attention(
     batch_id = nl.program_id(axis=0)
     head_id = nl.program_id(axis=1)
 
-    num_active_blocks, = block_tables.shape
+    # num_active_blocks, = block_tables.shape
+    num_active_blocks = cdiv(max_seqlen_k, block_size)
     context_kv_len = num_active_blocks * block_size
     assert (
         LARGE_TILE_SZ % B_F_SIZE == 0
@@ -817,7 +818,7 @@ def flash_paged_attention(
     acc_type = np.dtype(np.float32) if mixed_precision else kernel_dtype
     softmax_scale = softmax_scale or (1.0 / (d**0.5))
     num_large_k_tile = context_kv_len // LARGE_TILE_SZ
-    assert num_large_k_tile>0, f"invalid num_large_k_tile: {num_large_k_tile=}, {context_kv_len=}"
+    assert (num_large_k_tile % LARGE_TILE_SZ) == 0, f"invalid num_large_k_tile: {num_large_k_tile=}, {context_kv_len=}"
 
     o = nl.ndarray((b, h, seqlen_q, d),
                    dtype=query.dtype,
@@ -844,39 +845,41 @@ def flash_paged_attention(
             buffer=nl.sbuf,
             lazy_initialization=True,
         )
-    block_tables_sbuf = load_active_block_tables(
-        block_tables_hbm=block_tables,
-        num_tiles=num_large_k_tile,
-        num_blocks_per_tile=num_blocks_per_large_tile,
-    )
 
-    # On Neuron, we need B_P_SIZE(128) blocks to make DMA efficient
-    if num_blocks_per_large_tile < B_P_SIZE:
-        # we checked num_blocks_per_tile is a power of 2
-        assert B_P_SIZE % num_blocks_per_large_tile == 0
-        block_size_tiling_factor = B_P_SIZE // num_blocks_per_large_tile
-        assert block_size % block_size_tiling_factor == 0
-        num_blocks_per_large_tile *= block_size_tiling_factor  # i.e. = B_P_SIZE
-    else:
-        block_size_tiling_factor = 1
-    tiled_block_size = block_size // block_size_tiling_factor
-    _print(f"{tiled_block_size=}, {block_size=}, {block_size_tiling_factor=}")
+    if max_seqlen_k > 0:
+        block_tables_sbuf = load_active_block_tables(
+            block_tables_hbm=block_tables,
+            num_tiles=num_large_k_tile,
+            num_blocks_per_tile=num_blocks_per_large_tile,
+        )
 
-    # Indirect DMA load must be placed along Partition Dimension
-    block_tables_sbuf = transform_block_tables_for_indirect_load(
-        block_tables_sbuf,
-        block_size_tiling_factor=block_size_tiling_factor,
-        num_head=k_h,
-        head_id=head_id,
-    )
+        # On Neuron, we need B_P_SIZE(128) blocks to make DMA efficient
+        if num_blocks_per_large_tile < B_P_SIZE:
+            # we checked num_blocks_per_tile is a power of 2
+            assert B_P_SIZE % num_blocks_per_large_tile == 0
+            block_size_tiling_factor = B_P_SIZE // num_blocks_per_large_tile
+            assert block_size % block_size_tiling_factor == 0
+            num_blocks_per_large_tile *= block_size_tiling_factor  # i.e. = B_P_SIZE
+        else:
+            block_size_tiling_factor = 1
+        tiled_block_size = block_size // block_size_tiling_factor
+        _print(f"{tiled_block_size=}, {block_size=}, {block_size_tiling_factor=}")
 
-    # Flatten KV cache to be 2D for loading into SBUF
-    new_cache_shape = (
-        2 * num_blocks * k_h * block_size_tiling_factor,
-        tiled_block_size * d,
-    )
-    v_cache_offset = num_blocks * k_h * block_size_tiling_factor * tiled_block_size * d
-    kv_cache = kv_cache.reshape(new_cache_shape)
+        # Indirect DMA load must be placed along Partition Dimension
+        block_tables_sbuf = transform_block_tables_for_indirect_load(
+            block_tables_sbuf,
+            block_size_tiling_factor=block_size_tiling_factor,
+            num_head=k_h,
+            head_id=head_id,
+        )
+
+        # Flatten KV cache to be 2D for loading into SBUF
+        new_cache_shape = (
+            2 * num_blocks * k_h * block_size_tiling_factor,
+            tiled_block_size * d,
+        )
+        v_cache_offset = num_blocks * k_h * block_size_tiling_factor * tiled_block_size * d
+        kv_cache = kv_cache.reshape(new_cache_shape)
 
     # Global Flash Attention accumulators
     o_buffer = nl.zeros(
@@ -900,9 +903,6 @@ def flash_paged_attention(
 
     max_num_seqs = num_seqs # cu_seqlens_q.shape[0] - 1
 
-    prior_mask = nl.ndarray((max_seqlen_q, max_seqlen_k),
-                            dtype=nl.bool_,
-                            buffer=nl.private_hbm)
     active_mask = nl.ndarray((max_seqlen_q, max_seqlen_q),
                              dtype=nl.bool_,
                              buffer=nl.private_hbm)
@@ -912,19 +912,27 @@ def flash_paged_attention(
     i_p = nl.arange(1)[:, None]
     i_f = nl.arange(max_num_seqs)[None, :]
     seqused_k_sbuf = nl.load(seqused_k[i_f])
-    prior_mask = build_attention_mask(prior_mask,
-                         cu_seqlens_q,
-                         cu_seqlens_k,
-                         seqused_k_sbuf,
-                         max_seqlen_q,
-                         max_seqlen_k,
-                         max_num_seqs=max_num_seqs,
-                         block_size=block_size,
-                         tiled_block_size=tiled_block_size,
-    )
+    if max_seqlen_k > 0:
+        prior_mask = nl.ndarray((max_seqlen_q, max_seqlen_k),
+                                dtype=nl.bool_,
+                                buffer=nl.private_hbm)
+        prior_mask = build_attention_mask(prior_mask,
+                             cu_seqlens_q,
+                             cu_seqlens_k,
+                             seqused_k_sbuf,
+                             max_seqlen_q,
+                             max_seqlen_k,
+                             max_num_seqs=max_num_seqs,
+                             block_size=block_size,
+                             # tiled_block_size=tiled_block_size,
+        )
 
-    assert prior_mask.shape[-1] == (num_large_k_tile * LARGE_TILE_SZ), (
-        f"unexpected prior_mask shape: {prior_mask.shape=}, {num_large_k_tile=}, {context_kv_len=}, {num_active_blocks=}, {block_tables.shape=}")
+    # only reorder cached token mask
+    if max_seqlen_k > 0:
+        transpose_kv_token_mask(prior_mask, tiled_block_size)
+        assert (prior_mask.shape[-1] % (num_large_k_tile * LARGE_TILE_SZ)) == 0, (
+            f"unexpected prior_mask shape: {prior_mask.shape=}, {num_large_k_tile=}, {context_kv_len=}, {num_active_blocks=}, {block_tables.shape=}")
+
     for large_k_tile_idx in nl.sequential_range(0, num_large_k_tile):
         cur_mask = nl.load(prior_mask[
             nl.ds(0, B_P_SIZE),
@@ -932,18 +940,19 @@ def flash_paged_attention(
         ])
         nl.store(mask_output[head_id, large_k_tile_idx, :, :], cur_mask[:, :])
 
-    num_loads = num_blocks_per_large_tile // B_P_SIZE
-    # XXX: Work around a DMA skipping correctness issue:
-    #      If nl.ndarray is used to allocate buffer for DMA skipping,
-    #      kernel does not produce correct results.
-    k_load_buffer = nl.zeros(
-        (par_dim(B_P_SIZE), num_loads, tiled_block_size * B_D_SIZE),
-        dtype=kernel_dtype,
-    )
-    v_load_buffer = nl.zeros(
-        (par_dim(B_P_SIZE), num_loads * tiled_block_size * B_D_SIZE),
-        dtype=kernel_dtype,
-    )
+    if max_seqlen_k > 0:
+        num_loads = num_blocks_per_large_tile // B_P_SIZE
+        # XXX: Work around a DMA skipping correctness issue:
+        #      If nl.ndarray is used to allocate buffer for DMA skipping,
+        #      kernel does not produce correct results.
+        k_load_buffer = nl.zeros(
+            (par_dim(B_P_SIZE), num_loads, tiled_block_size * B_D_SIZE),
+            dtype=kernel_dtype,
+        )
+        v_load_buffer = nl.zeros(
+            (par_dim(B_P_SIZE), num_loads * tiled_block_size * B_D_SIZE),
+            dtype=kernel_dtype,
+        )
 
     for large_k_tile_idx in nl.sequential_range(0, num_large_k_tile):
         # cur_k_tile = nl.ndarray(
@@ -1018,7 +1027,7 @@ def flash_paged_attention(
                          max_seqlen_q,
                          max_num_seqs=max_num_seqs,
                          block_size=block_size,
-                         tiled_block_size=tiled_block_size,
+                         # tiled_block_size=tiled_block_size,
                          contexted=True
     )
     # cu_query_lens, cu_query_lens, query_lens, max_query_lens, max_query_lens, max_num_seqs, block_size, contexted=True)
@@ -1081,7 +1090,8 @@ def flash_paged_attention(
                     tile_mask=cur_mask,
                     use_causal_mask=True,
                     q_tile_idx=i,
-                    initialize=False,
+                    initialize= (i == 0),
+                    # initialize=False,
                     B_D_SIZE=B_D_SIZE,
                     qk_res_buffer=(qk_res_buffer[i, i_q_h]
                                    if qk_res_buffer is not None else None),
@@ -1130,7 +1140,7 @@ def flash_paged_attention(
 
     if return_debug_tensors:
         return o, hbm_m_buffer, hbm_l_buffer, hbm_qk_res
-    return o, prior_mask, active_mask
+    return o, active_mask
 
 
 def reorder_context_mask(mask, LARGE_TILE_SZ, block_size):

@@ -315,8 +315,8 @@ def test_contexted_kv_attention(
     torch.set_default_device("cpu")
     dtype = torch.float32
 
-    min_ctx_len = 1 # 2
-    max_ctx_len = 1 # 12
+    min_ctx_len = 0 # 2
+    max_ctx_len = 0 # 12
     min_query_len = 3 # 2
     max_query_len = 3 # 12
     num_kv_heads = num_heads // num_queries_per_kv
