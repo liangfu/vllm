@@ -8,6 +8,8 @@ import torch
 import torch.nn.functional as F
 import numpy as np
 
+from vllm.utils import cdiv
+
 
 class BlockDiagonalCausalFromBottomRightMask:
 
@@ -265,7 +267,7 @@ def get_active_block_tables(block_tables, query_lens, seq_lens, block_size, num_
         # (1, 199, 1, 512, 4, 2, 8, True),  # same with mixed precision
         # Test common/medium configurations
         # (3, 5, 16, 2048, 4, 2, 64, True),  # common case, larger heads
-        (1, 0, 16, 2048, 1, 1, 64, True),  # common case, larger heads
+        (3, 5, 4, 128, 1, 1, 8, True),  # common case, larger heads
         # (4, 12, 32, 2048, 16, 4, 32,
         #  True),  # medium size, mixed precision, grouped-query attention (GQA)
         # # Test large configurations
@@ -315,10 +317,10 @@ def test_contexted_kv_attention(
     torch.set_default_device("cpu")
     dtype = torch.float32
 
-    min_ctx_len = 0 # 2
-    max_ctx_len = 0 # 12
-    min_query_len = 3 # 2
-    max_query_len = 3 # 12
+    min_ctx_len = 2 # 2
+    max_ctx_len = 12 # 12
+    min_query_len = 2 # 2
+    max_query_len = 12 # 12
     num_kv_heads = num_heads // num_queries_per_kv
     (
         query,
@@ -370,8 +372,8 @@ def test_contexted_kv_attention(
         return 2 ** int(a - 1).bit_length()
 
     # calculate input shapes
-    # max_num_queries = pad_to_next_power_of_2(sum(query_lens))
-    max_num_queries = pad_to_multiple(sum(query_lens), B_P_SIZE)
+    max_num_queries = pad_to_next_power_of_2(sum(query_lens))
+    # max_num_queries = pad_to_multiple(sum(query_lens), B_P_SIZE)
     context_lens = torch.tensor(seq_lens) - torch.tensor(query_lens)
     num_active_blocks = ceil_div(context_lens, block_size).sum().item()
     num_active_blocks = pad_to_multiple(num_active_blocks, large_tile_size // block_size)
@@ -414,8 +416,8 @@ def test_contexted_kv_attention(
 
     # build active block table
     # TODO(liangfu): move this implementation into NKI kernel
-    num_blocks = 2048 // block_size
-    active_block_table = torch.zeros(num_blocks * 2, dtype=torch.int32, device=context_lens.device)
+    num_blocks = pad_to_next_power_of_2(cdiv(context_lens, block_size).sum().item())
+    active_block_table = torch.zeros(num_blocks, dtype=torch.int32, device=context_lens.device)
     indices = torch.arange(num_blocks, dtype=torch.int32, device=context_lens.device)
     offset = torch.tensor(0, dtype=torch.int32, device=context_lens.device)  # Start after the initial zeros
     for seq_idx in range(num_seqs):
@@ -423,7 +425,7 @@ def test_contexted_kv_attention(
         active_block_table.index_put_((indices[:blocks_for_seq] + offset,), block_tables[seq_idx, :blocks_for_seq])
         offset += blocks_for_seq
     active_block_table = active_block_table[:num_blocks]
-    assert active_block_table.shape[0] == 128, f"invalid active_blocks_table shape: {active_block_table.shape=}"
+    # assert active_block_table.shape[0] == 128, f"invalid active_blocks_table shape: {active_block_table.shape=}"
 
     def to_device(x):
         # return x.numpy()

@@ -11,10 +11,6 @@ from neuronxcc.nki.isa.constants import oob_mode
 
 from vllm.utils import cdiv
 
-B_P_SIZE = 128
-B_F_SIZE = 512
-LARGE_TILE_SZ = 2048
-
 def is_power_of_2(x):
     return x > 0 and (x & (x - 1)) == 0
 
@@ -26,14 +22,14 @@ def _print(*args, **kwargs):
     print(*args)
 
 @nki.jit
-def load_active_block_tables(block_tables_hbm, num_tiles, num_blocks_per_tile):
+def load_active_block_tables(block_tables_hbm, num_tiles, num_blocks_per_tile, B_P_SIZE):
     """
     Load block tables from HBM into SRAM
 
     `block_tables_hbm` has shape `(num_tiles * num_blocks_per_tile, )`.
     In case `num_tiles > B_P_SIZE`, we need further tile `num_tile` dimension.
     """
-    global B_P_SIZE
+
     partition_size = min(B_P_SIZE, num_tiles)
     assert partition_size > 0, f"invalid partition size: {partition_size=}"
     _print(f"{block_tables_hbm.shape=}, {num_tiles=}, {num_blocks_per_tile=}, {partition_size=}")
@@ -67,6 +63,7 @@ def transform_block_tables_for_indirect_load(
     block_size_tiling_factor,
     num_head,
     head_id,
+    B_P_SIZE,
 ):
     """
     This function does two things:
@@ -87,8 +84,6 @@ def transform_block_tables_for_indirect_load(
     Note:
     We don't further tile D dimension as small DMA size also hurts performance.
     """
-    global B_P_SIZE
-
     num_tiles_per_partition, num_partitions, num_blocks_per_tile = (
         block_tables.shape)
     assert is_power_of_2(
@@ -154,6 +149,7 @@ def load_kv_tile_from_cache(
     large_k_tile_idx,
     num_blocks_per_large_tile,
     tiled_block_size,
+    B_P_SIZE,
     B_D_SIZE,
     kernel_dtype,
     k_load_buffer,
@@ -171,8 +167,6 @@ def load_kv_tile_from_cache(
     Value: (seqlen_kv // B_P_SIZE, par_dim(B_P_SIZE), B_D_SIZE)
            equivalent to (par_dim(B_P_SIZE), seqlen_kv // B_P_SIZE * B_D_SIZE)
     """
-    global B_P_SIZE
-
     i_p = nl.arange(B_P_SIZE)[:, None]
     i_f = nl.arange(tiled_block_size * B_D_SIZE)[None, :]
 
@@ -438,6 +432,7 @@ def build_attention_mask(
     block_size,
     # tiled_block_size,
     contexted=False,
+    B_F_SIZE=512,
 ):
     """
     Creates block diagonal causal masks for multiple prompts.
@@ -632,7 +627,7 @@ def build_attention_mask(
     return prior_mask
 
 @nki.jit
-def transpose_kv_token_mask(mask, tiled_block_size):
+def transpose_kv_token_mask(mask, tiled_block_size, B_P_SIZE=128):
     """
     from
     (total_query_len, context_kv_len // LARGE_TILE_SZ, num_tiled_blocks // B_P_SIZE, B_P_SIZE, tiled_block_size)
@@ -661,6 +656,8 @@ def transpose_kv_token_mask(mask, tiled_block_size):
         transposed = nl.transpose(tile)
         _print(f"{transposed.shape=}")
         nl.store(mask_out[q_idx, i_p_dst, i_f_dst], value=transposed)
+    import pdb
+    pdb.set_trace()
     return mask_out
 
 import uuid
@@ -729,13 +726,18 @@ def flash_paged_attention(
       GQA: q: [b, h, d, s], k: [b, kv_h, d, s], v: [b, kv_h, s, d]
         usage: `flash_fwd[b, kv_h](q, k, v, ...)`
     """
-    global B_P_SIZE, B_F_SIZE, LARGE_TILE_SZ
     mixed_precision = True
     return_debug_tensors = False
 
     b, h, d, seqlen_q = query.shape
+
+    # automatic determination of tunable parameters
+    B_P_SIZE = min(128, seqlen_q)
+    B_F_SIZE = 128
+    LARGE_TILE_SZ = min(512, B_F_SIZE)
     B_D_SIZE = d
-    n_tile_q = seqlen_q // B_P_SIZE  # since q will be loaded on tensor engine
+
+    n_tile_q = cdiv(seqlen_q, B_P_SIZE)  # since q will be loaded on tensor engine
     assert n_tile_q >= 1, f"at least 1 query-tile is required: {seqlen_q} vs {B_P_SIZE}"
     _, num_blocks, k_h, block_size, _ = kv_cache.shape
     q_h_per_k_h = h // k_h
@@ -823,6 +825,7 @@ def flash_paged_attention(
             block_tables_hbm=block_tables,
             num_tiles=num_large_k_tile,
             num_blocks_per_tile=num_blocks_per_large_tile,
+            B_P_SIZE=B_P_SIZE,
         )
 
         # On Neuron, we need B_P_SIZE(128) blocks to make DMA efficient
@@ -843,6 +846,7 @@ def flash_paged_attention(
             block_size_tiling_factor=block_size_tiling_factor,
             num_head=k_h,
             head_id=head_id,
+            B_P_SIZE=B_P_SIZE,
         )
 
         # Flatten KV cache to be 2D for loading into SBUF
@@ -898,10 +902,11 @@ def flash_paged_attention(
                              max_num_seqs=max_num_seqs,
                              block_size=block_size,
                              # tiled_block_size=tiled_block_size,
+                             B_F_SIZE=B_F_SIZE,
         )
 
         # only reorder cached token mask
-        tiled_mask = transpose_kv_token_mask(prior_mask, tiled_block_size)
+        tiled_mask = transpose_kv_token_mask(prior_mask, tiled_block_size, B_P_SIZE=B_P_SIZE)
         assert (tiled_mask.shape[-2]*tiled_mask.shape[-1] % (num_large_k_tile * LARGE_TILE_SZ)) == 0, (
             f"unexpected tiled_mask shape: {tiled_mask.shape=}, {prior_mask.shape=}, {num_large_k_tile=}, "
             f"{context_kv_len=}, {num_active_blocks=}, {block_tables.shape=}")
@@ -947,6 +952,7 @@ def flash_paged_attention(
             large_k_tile_idx=large_k_tile_idx,
             num_blocks_per_large_tile=num_blocks_per_large_tile,
             tiled_block_size=tiled_block_size,
+            B_P_SIZE=B_P_SIZE,
             B_D_SIZE=B_D_SIZE,
             kernel_dtype=kernel_dtype,
             k_load_buffer=k_load_buffer,
@@ -1204,7 +1210,7 @@ def flash_attn_varlen_func(
     """
     N, _, n_kv_head, _, _ = kv_cache.shape
     assert N == 2, f"invalid {kv_cache.shape=}"
-    assert block_tables.shape[0] == 128, f"invalid block_tables shape: {block_tables.shape=}"
+    # assert block_tables.shape[0] == 128, f"invalid block_tables shape: {block_tables.shape=}"
 
     o, *debug_tensors = flash_paged_attention[1, n_kv_head](
         query,
