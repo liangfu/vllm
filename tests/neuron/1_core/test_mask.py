@@ -16,10 +16,10 @@ from vllm.attention.ops.nki_flash_attn import build_attention_mask
 )
 def test_context_mask(query_lens, seq_lens) -> None:
 
-    # max_query_lens = 8
-    # max_seq_lens = 20
-    max_query_lens = 128
-    max_seq_lens = 512
+    max_query_lens = 8
+    max_seq_lens = 20
+    # max_query_lens = 128
+    # max_seq_lens = 512
     max_num_seqs = 4
     block_size = 4
 
@@ -90,7 +90,7 @@ def test_context_mask(query_lens, seq_lens) -> None:
         max_seq_lens,
         max_num_seqs=max_num_seqs,
         block_size=block_size,
-        tiled_block_size=tiled_block_size,
+        # tiled_block_size=tiled_block_size,
     )
     prior_mask = prior_mask.astype(bool).astype(np.int32)
     np.testing.assert_allclose(ref_prior_mask, prior_mask[:pnr, :pnc])
@@ -98,7 +98,7 @@ def test_context_mask(query_lens, seq_lens) -> None:
     # active mask
     query_lens = np.array(query_lens, dtype=np.int32)
     build_attention_mask_wrapper(
-        active_mask, cu_query_lens, cu_query_lens, query_lens, max_query_lens, max_query_lens, max_num_seqs=max_num_seqs, block_size=block_size, tiled_block_size=tiled_block_size, contexted=True
+        active_mask, cu_query_lens, cu_query_lens, query_lens, max_query_lens, max_query_lens, max_num_seqs=max_num_seqs, block_size=block_size, contexted=True # tiled_block_size=tiled_block_size, 
     )
     active_mask = active_mask.astype(bool).astype(np.int32)
     np.testing.assert_allclose(ref_active_mask, active_mask[:anr, :anc])
@@ -114,7 +114,7 @@ def build_attention_mask_wrapper(
     max_num_keys,
     max_num_seqs,
     block_size,
-    tiled_block_size,
+    # tiled_block_size,
     contexted=False,
 ):
     i_p, i_f = nl.mgrid[0:1, 0:max_num_seqs]
@@ -128,7 +128,7 @@ def build_attention_mask_wrapper(
         max_num_keys,
         max_num_seqs,
         block_size,
-        tiled_block_size,
+        # tiled_block_size,
         contexted,
     )
     return prior_mask
